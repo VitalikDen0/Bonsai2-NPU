@@ -1,0 +1,56 @@
+// Bonsai Q1_0 GEMV for Hexagon CDSP (v75 codegen, runs on v79).
+// y[out] row-major binary GEMV: y[i] = sum_j s_g(j) * (bit(i,j) ? +x[j] : -x[j])
+// bits: lsb-first bytes, padded rows (prow bytes per row, caller passes prow).
+// scales: fp16 per group of 128, s_g = stored/2 (MLX s_mlx = 2*s_g).
+#include "AEEStdDef.idl"
+#include "remote.idl"
+
+const string IDL_VERSION = "1.0.0";
+
+interface bonsai : remote_handle64 {
+   long gemv_q1(in long out_dim, in long in_dim, in long prow,
+                in sequence<float> x, in sequence<octet> bits,
+                in sequence<short> scales, rout sequence<float> y);
+   // zero-copy variant: all buffers pre-placed in rpcmem, passed as addresses.
+   // Pointers travel as hi/lo 32-bit pairs (qaic int64 marshaling is suspect).
+   long gemv_q1r(in long out_dim, in long in_dim, in long prow,
+                 in long x_hi, in long x_lo,
+                 in long bits_hi, in long bits_lo,
+                 in long scales_hi, in long scales_lo,
+                 in long y_hi, in long y_lo);
+   // file probe: read 64 bytes from device path at byte offset off.
+   long fprobe(in long off_hi, in long off_lo, rout sequence<octet> data);
+   // mmap probe: mmap 64MB window at file offset, read 64 bytes at window offset.
+   long fmaptest(in long win_hi, in long win_lo, in long at_off, rout sequence<octet> data);
+   // bulk read benchmark: FNV-1a over len bytes at 64-bit offset, no bulk return.
+   long bread(in long off_hi, in long off_lo, in long len, rout long long csum);
+   // Register Hadamard signs vector (17408 floats) once at startup
+   long set_signs(in sequence<float> signs);
+   // Fused MLP: gate_up GEMV -> SwiGLU -> FWHT-1024 -> down_proj GEMV (1 invocation instead of 2)
+   long mlp_fused(in sequence<float> x,
+                  in sequence<octet> gate_bits, in sequence<short> gate_scales,
+                  in sequence<octet> down_bits, in sequence<short> down_scales,
+                  rout sequence<float> y);
+   // Register Hadamard signs vector for specific dimension (5120, 6144, 17408)
+   long set_signs_dim(in long dim, in sequence<float> signs);
+   // Register static state pointers (ssm_conv, ssm_rec, lin_aux) in rpcmem once at startup
+   long register_lin_states(in sequence<float> ssm_conv,
+                            in sequence<float> ssm_rec,
+                            in sequence<octet> lin_aux);
+   // Fused Linear Attention Block: in_proj -> ab -> conv1d -> qknorm -> deltanet -> gated -> fwht -> out_proj
+   long lin_attn_fused(in long layer_idx,
+                       in sequence<float> x,
+                       in sequence<octet> in_bits, in sequence<short> in_scales,
+                       in sequence<octet> out_bits, in sequence<short> out_scales,
+                       rout sequence<float> y);
+   // Full Fused Linear Attention + MLP Layer (1 RPC per layer):
+   // Input RMSNorm -> Linear Attention -> Residual 1 -> Post-Attn RMSNorm -> FWHT-5120 -> Fused MLP -> Residual 2
+   long lin_layer_fused(in long layer_idx,
+                        in sequence<float> x,
+                        in sequence<octet> in_bits, in sequence<short> in_scales,
+                        in sequence<octet> out_bits, in sequence<short> out_scales,
+                        in sequence<octet> gate_bits, in sequence<short> gate_scales,
+                        in sequence<octet> down_bits, in sequence<short> down_scales,
+                        rout sequence<float> y);
+};
+

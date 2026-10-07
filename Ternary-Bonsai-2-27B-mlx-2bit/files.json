@@ -1,0 +1,98 @@
+{
+  ".gitattributes": {
+    "sha256": "a5955c3ae733be7a3bf851691bb74b7c20cc71171e3163b7ec03b402124ba964",
+    "size": 144
+  },
+  "LICENSE": {
+    "sha256": "69849221bfb90053de2134ef5e6d540287b4b98062326492f1f96f5da685524b",
+    "size": 10174
+  },
+  "NOTICE.txt": {
+    "sha256": "de0e0c48fb6f691a31e74f338e3ccf93f9ecdfe2866ab769c4bf8b79a7636a30",
+    "size": 411
+  },
+  "PACK-RUNTIME.md": {
+    "sha256": "486bf73b40dab072792cb2e48961a3698d4ca599f1355f3e628e4c64d8aa4cce",
+    "size": 969
+  },
+  "README.md": {
+    "sha256": "c2d9602f21e10b855987c25d3f7bb0198874af8a612707c1b9e85c3c6ac167cc",
+    "size": 23151
+  },
+  "assets/bonsai-logo.svg": {
+    "sha256": "3cc33d50fa2c2bce9fdf3d8e48f41e016ff86baa92c61b66cbf56e6b9ca47444",
+    "size": 515
+  },
+  "chat_template.jinja": {
+    "sha256": "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041",
+    "size": 8952
+  },
+  "config.json": {
+    "sha256": "238de7c512cc56a733421e3fd011d88f8260739e3d00e32c5d65b7943cc9f837",
+    "size": 58145
+  },
+  "generation_config.json": {
+    "sha256": "e70c136c1b78ddc1fb0905bac8e733a4dc448d4f852a5dd75143fffc70be550e",
+    "size": 202
+  },
+  "hadamard.json": {
+    "sha256": "7132a3ec364f0bdac1f08f905f24f0ad2f14245060f592637a0396826d3b5fe6",
+    "size": 297903
+  },
+  "model.safetensors": {
+    "sha256": "130de5925082c168b7866b2e91b52e44abbafc99017e3ca352b77b5b55a269ed",
+    "size": 8595477990
+  },
+  "preprocessor_config.json": {
+    "sha256": "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516",
+    "size": 390
+  },
+  "quickstart.py": {
+    "sha256": "094ecaee12c0800cec2a68358c3370db7d31abe7757f95f7bf1edde4f4e48cbb",
+    "size": 3882
+  },
+  "reload-validation.json": {
+    "sha256": "41ec215fe19fa8ad59527fca6594a782d1b7f23b69948ef063311c768217788e",
+    "size": 86
+  },
+  "runtime/LICENSE": {
+    "sha256": "ccfab7ccb2ea306f71531c8ca77bb55507606cd90768b1e32b8b52ab5b48cf01",
+    "size": 1066
+  },
+  "runtime/artifact.py": {
+    "sha256": "5279718d7671bd799e866f53099e82b0260117fec811f83011ba47a0abc7943e",
+    "size": 5621
+  },
+  "runtime/codec.py": {
+    "sha256": "7f7fd67637a7d9363eab8ebf7db59771830b690330ffef772379a0169ddb9608",
+    "size": 2572
+  },
+  "runtime/requirements.txt": {
+    "sha256": "358bc104a02ea598f1e6cde8e7eeed169b9ec34f69f3543b47b390706446a1e0",
+    "size": 115
+  },
+  "runtime/runtime.py": {
+    "sha256": "30ad3905775040a8167360a009168b9ede1436cb02dc43e9e743432482eafbbf",
+    "size": 10674
+  },
+  "runtime/vision_artifact.py": {
+    "sha256": "b3d9645300d913cc09abff04bf25f31621daac4d507e7e1a8b00a64442a05a3e",
+    "size": 5285
+  },
+  "tokenizer-validation.json": {
+    "sha256": "b36f33d09bd3de3e19de3fd2cf493a69ec0a5e24acf648b0c9fba120d9357554",
+    "size": 63
+  },
+  "tokenizer.json": {
+    "sha256": "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3",
+    "size": 12809320
+  },
+  "tokenizer_config.json": {
+    "sha256": "b11349aafa7cdc6a320767cf7ceb29ed82f7eda5d65e8e0819e76f0ce947bf27",
+    "size": 17928
+  },
+  "video_preprocessor_config.json": {
+    "sha256": "7768af27c1fafa9cc9011c1dc20067e03f8915e03b63504550e11d5066986d13",
+    "size": 385
+  }
+}

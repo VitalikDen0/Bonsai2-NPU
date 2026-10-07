@@ -1,0 +1,88 @@
+Bonsai-NPU Source-Available Non-Commercial & Anti-Enterprise-R&D License
+Version 1.2
+
+Copyright (c) 2026 VitalikDen0. All rights reserved.
+
+================================================================================
+1. GRANT OF RIGHTS AND CONDITIONS
+================================================================================
+Subject to the strict terms, limitations, and prohibitions of this License,
+the Licensor (VitalikDen0) hereby grants to any eligible Individual Licensee
+a personal, non-exclusive, non-transferable, royalty-free, limited license to
+inspect, compile, run, and modify the source code and associated documentation
+(the "Software") SOLELY AND EXCLUSIVELY for personal, non-commercial, hobbyist,
+or uncommissioned public educational purposes.
+
+Downloading, cloning, copying, compiling, or accessing any part of the Software
+constitutes immediate and unconditional acceptance of all terms, conditions,
+and prohibitions of this License.
+
+================================================================================
+2. DEFINITION OF COMMERCIAL ENTITY AND PROHIBITION OF ENTERPRISE USE
+================================================================================
+A "Commercial Entity" is defined as any for-profit corporation, enterprise,
+company, business, partnership, joint venture, foundation, sole proprietorship,
+or any entity or individual acting on behalf of, employed by, or commissioned by
+any of the foregoing.
+
+2.1. ENTERPRISE INTERNAL R&D PROHIBITION:
+Any access, reproduction, execution, compilation, evaluation, benchmarking,
+profiling, architectural inspection, reverse engineering, or study of the
+Software by or for the benefit of any Commercial Entity—including, without
+limitation, within private corporate networks, closed enterprise development
+environments, hardware design labs, internal research and development (R&D)
+initiatives, driver engineering, or silicon optimization—is strictly PROHIBITED.
+
+2.2. PROHIBITION OF ARCHITECTURAL & METHODOLOGICAL EXTRACTION:
+No Commercial Entity or individual acting for commercial purposes may copy,
+adapt, extract, reimplement, or derive any algorithms, memory mapping methods,
+SMMU allocation schemes, FastRPC zero-copy techniques, HVX DSP vector kernels,
+Multi-Token Prediction (MTP) dispatch logic, or Turbo4 quantization mechanics
+originating from this Software into any commercial product, firmware, driver,
+hardware accelerator, or internal development pipeline.
+
+2.3. PROHIBITION OF COMMERCIAL DEPLOYMENT:
+The Software may NOT be used in, bundled with, integrated into, or offered as
+part of any commercial service, paid software, commercial cloud endpoint,
+subscription service, mobile application with paid tiers/ads, or revenue-generating
+activity of any kind.
+
+================================================================================
+3. ELIGIBLE NON-COMMERCIAL USE
+================================================================================
+The rights granted under Section 1 are restricted exclusively to:
+(a) Natural persons using the Software on their personal devices strictly for
+    personal curiosity, hobby projects, or self-education, without any financial
+    gain, commercial affiliation, or corporate sponsorship;
+(b) Students and independent researchers at accredited public universities,
+    provided that the work is not funded, commissioned, or directed by a
+    Commercial Entity.
+
+================================================================================
+4. COMMERCIAL LICENSING INQUIRIES
+================================================================================
+Any use outside the express permissions of this License—including evaluation,
+internal enterprise R&D, commercial integration, or hardware co-design—requires
+a separate, formal written commercial license agreement executed directly with
+the author (VitalikDen0).
+
+For commercial licensing and enterprise partnerships, contact:
+VitalikDen0 (me@zepmoriq.com) or via GitHub (https://github.com/VitalikDen0).
+
+================================================================================
+5. NO WARRANTY & LIMITATION OF LIABILITY
+================================================================================
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, TITLE, AND NONINFRINGEMENT. IN NO EVENT SHALL
+THE AUTHOR OR COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+================================================================================
+6. SEVERABILITY
+================================================================================
+If any provision of this License is held to be invalid, illegal, or unenforceable
+under applicable law, such provision shall be enforced to the maximum extent
+permissible, and the remaining provisions shall continue in full force and effect.

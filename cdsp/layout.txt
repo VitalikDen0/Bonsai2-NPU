@@ -1,0 +1,11 @@
+tensors_index=1184 tensors_container=1184 errors=0
+payload_bytes=4708628960 payload_gb=4.709
+per_layer_bytes(first 4): {0: 53993408, 1: 53993408, 2: 53993408, 3: 52368384}
+layers=64 avg_layer_bytes=53587152
+kv_16K_Q8=536870912B (0.537GB)
+kv_16K_Q4=268435456B (0.268GB)
+kv_32K_Q8=1073741824B (1.074GB)
+kv_32K_Q4=536870912B (0.537GB)
+kv_65K_Q8=2147483648B (2.147GB)
+kv_65K_Q4=1073741824B (1.074GB)
+ssm_state=50331648B (50.3MB)
