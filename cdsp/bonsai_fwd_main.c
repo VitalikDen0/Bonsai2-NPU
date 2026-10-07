@@ -240,6 +240,7 @@ static float* kvks = NULL;
 static float* kvvs = NULL;
 static int g_ctx = 4096;
 static int g_dsp_ctx = 4096;
+static int g_turbo4 = 0;
 static uint8_t* g_lin_aux = NULL;
 static int g_fused_lin = 1;
 static int g_fused_mlp = 1;
@@ -860,7 +861,11 @@ static int stage_init(void) {
     // 0. Register CDSP linear attention states FIRST while 100% of CDSP 32-bit VA is free!
     //    (Uses lossless BF16 packing for in_proj_a/b: 55.04 MiB instead of 100.04 MiB, saving 45 MiB of CDSP VA!)
     if (g_fused_lin && g_h) {
-        int req_ctx = (g_ctx > 4096) ? 4096 : g_ctx;
+        float dummy[1] = {0.0f};
+        int r_t4 = bonsai_set_signs_dim(g_h, g_turbo4 ? 4 : 8, dummy, 1);
+        fprintf(stderr, "[fwd] CDSP bonsai_set_signs_dim(%d) [Turbo4=%d] rc=%d\n", g_turbo4 ? 4 : 8, g_turbo4, r_t4);
+        int max_limit = g_turbo4 ? 16384 : 4096;
+        int req_ctx = (g_ctx > max_limit) ? max_limit : g_ctx;
         if (req_ctx < 256) req_ctx = 256;
         g_dsp_ctx = req_ctx;
         size_t lin_aux_sz = (size_t)48 * 1188736 + (size_t)16 * 43008 + (size_t)g_dsp_ctx * 256;
@@ -1121,7 +1126,8 @@ static int stage_init(void) {
 
     // Pre-allocate Demand-Paged Overcommit KV-cache (MAP_NORESERVE consumes 0 physical RAM upfront!)
 #ifndef _WIN32
-    size_t kv_sz  = (size_t)16 * 4 * 256 * g_ctx;
+    size_t kv_dim_bytes = g_turbo4 ? 128 : 256;
+    size_t kv_sz  = (size_t)16 * 4 * kv_dim_bytes * g_ctx;
     size_t kvs_sz = (size_t)16 * 4 * g_ctx * sizeof(float);
     if (!kvk) {
         kvk = (int8_t*)mmap(NULL, kv_sz, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE | MAP_NORESERVE, -1, 0);
@@ -1140,8 +1146,9 @@ static int stage_init(void) {
         if (kvvs == MAP_FAILED) kvvs = NULL;
     }
 #else
-    if (!kvk)  kvk  = (int8_t*)calloc((size_t)16 * 4 * 256 * g_ctx, 1);
-    if (!kvv)  kvv  = (int8_t*)calloc((size_t)16 * 4 * 256 * g_ctx, 1);
+    size_t kv_dim_bytes = g_turbo4 ? 128 : 256;
+    if (!kvk)  kvk  = (int8_t*)calloc((size_t)16 * 4 * kv_dim_bytes * g_ctx, 1);
+    if (!kvv)  kvv  = (int8_t*)calloc((size_t)16 * 4 * kv_dim_bytes * g_ctx, 1);
     if (!kvks) kvks = (float*)calloc((size_t)16 * 4 * g_ctx, sizeof(float));
     if (!kvvs) kvvs = (float*)calloc((size_t)16 * 4 * g_ctx, sizeof(float));
 #endif
@@ -3279,11 +3286,22 @@ int main(int argc, char** argv) {
         g_profile_tree = 1;
         fprintf(stderr, "[fwd] Hierarchical debug profiling tree enabled via BONSAI_PROFILE_TREE\n");
     }
+    if (getenv("BONSAI_TURBO4")) {
+        g_turbo4 = atoi(getenv("BONSAI_TURBO4")) ? 1 : 0;
+    }
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--turbo4") == 0) {
+            g_turbo4 = 1;
+        }
+    }
+    if (g_turbo4) {
+        fprintf(stderr, "[fwd] TurboQuant / Turbo4 mode ENABLED (4-bit KV Cache: 16 KiB/token)\n");
+    }
     fprintf(stderr, "[fwd] start\n");
     if (argc < 4) {
-        printf("usage: bonsai_fwd model.npubin tok.bin \"prompt\" [nsteps] [ctx]\n");
-        printf("       bonsai_fwd model.npubin tok.bin --chat [ctx]\n");
-        printf("       bonsai_fwd model.npubin tok.bin --server [port] [ctx]\n");
+        printf("usage: bonsai_fwd model.npubin tok.bin \"prompt\" [nsteps] [ctx] [--turbo4]\n");
+        printf("       bonsai_fwd model.npubin tok.bin --chat [ctx] [--turbo4]\n");
+        printf("       bonsai_fwd model.npubin tok.bin --server [port] [ctx] [--turbo4]\n");
         return 2;
     }
     int is_chat   = (strcmp(argv[3], "--chat") == 0);

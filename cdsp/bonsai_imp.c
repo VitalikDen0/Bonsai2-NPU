@@ -361,6 +361,7 @@ static float g_dsp_signs_6144[6144] __attribute__((aligned(128)));
 static int g_dsp_has_signs_6144 = 0;
 
 int g_dsp_kv_ctx_max = 256;
+int g_dsp_turbo4 = 0;
 
 static float* g_dsp_ssm_conv = NULL;
 static float* g_dsp_ssm_rec = NULL;
@@ -396,6 +397,14 @@ int hvx_lin_layer_fused(int layer_idx,
 
 int bonsai_set_signs_dim(remote_handle64 _h, int dim, const float* signs, int signsLen) {
     (void)_h;
+    if (dim == 4) {
+        g_dsp_turbo4 = 1;
+        return 0;
+    }
+    if (dim == 8) {
+        g_dsp_turbo4 = 0;
+        return 0;
+    }
     if (dim == 5120 && signs && signsLen >= 5120) {
         memcpy(g_dsp_signs_5120, signs, 5120 * sizeof(float));
         g_dsp_has_signs_5120 = 1;
@@ -427,7 +436,8 @@ int bonsai_register_lin_states(remote_handle64 _h,
         if (g_dsp_ssm_conv) memset(g_dsp_ssm_conv, 0, conv_bytes);
         if (g_dsp_ssm_rec)  memset(g_dsp_ssm_rec, 0, rec_bytes);
         if (g_dsp_kvk && g_dsp_kv_ctx_max > 0) {
-            size_t kv_bytes  = (size_t)16 * 4 * g_dsp_kv_ctx_max * 128 * sizeof(uint32_t);
+            size_t kv_stride = g_dsp_turbo4 ? 32 : 128;
+            size_t kv_bytes  = (size_t)16 * 4 * g_dsp_kv_ctx_max * kv_stride * sizeof(uint32_t);
             size_t kvs_bytes = (size_t)16 * 4 * g_dsp_kv_ctx_max * sizeof(float);
             memset(g_dsp_kvk, 0, kv_bytes);
             memset(g_dsp_kvv, 0, kv_bytes);
@@ -469,8 +479,9 @@ int bonsai_register_lin_states(remote_handle64 _h,
     if (g_dsp_kvvs)    { free(g_dsp_kvvs);    g_dsp_kvvs = NULL; }
 
     int target_ctx = req_ctx;
+    size_t kv_stride = g_dsp_turbo4 ? 32 : 128;
     while (target_ctx >= 256) {
-        size_t kv_bytes   = (size_t)16 * 4 * target_ctx * 128 * sizeof(uint32_t);
+        size_t kv_bytes   = (size_t)16 * 4 * target_ctx * kv_stride * sizeof(uint32_t);
         size_t kvs_bytes  = (size_t)16 * 4 * target_ctx * sizeof(float);
 
         g_dsp_kvk_raw = malloc(kv_bytes + 128);

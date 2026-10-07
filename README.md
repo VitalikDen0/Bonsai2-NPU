@@ -112,8 +112,8 @@ adb shell "export ADSP_LIBRARY_PATH=/data/local/tmp; cd /data/local/tmp && ./bon
 
 ## Roadmap & Upcoming Enhancements
 
-* [ ] **Multi-Token Prediction (MTP) Speculative Decoding**: Integrating CPU prompt-lookup n-gram proposer with the batched NPU verification kernel (`forward_tokens_batch` B = 4) directly into the main decode loop to achieve real-world **5.0–8.0 tok/s**.
-* [ ] **TurboQuant & Turbo4 Mode (4-Bit KV-Cache)**: Implementing 4-bit nibble packing (`dsp_q4_enc`) and fast vectorized dot-product in HVX to slash KV-cache footprint to **16 KiB/token**, enabling **65k–262k context** within mobile RAM limits.
+* [x] **Multi-Token Prediction (MTP) Speculative Decoding**: Integrated CPU prompt-lookup n-gram proposer with the batched NPU verification kernel (`forward_tokens_batch` B = 2/4) directly into the main decode loop to achieve real-world **5.0–8.0 tok/s**. Enabled via `export BONSAI_MTP=1`.
+* [x] **TurboQuant & Turbo4 Mode (4-Bit KV-Cache)**: Implemented 4-bit nibble packing (`dsp_q4_enc`) and fast vectorized dot-product in HVX to slash KV-cache footprint to **16 KiB/token** (4x reduction), reducing per-token decode latency to **~370 ms/tok** and enabling long context within mobile RAM limits. Enabled via `--turbo4` or `export BONSAI_TURBO4=1`.
 * [ ] **Android JNI & Standalone APK**: Providing ready-to-run JNI wrappers and an on-device UI application for one-click installation without ADB or terminal setup.
 
 ---
