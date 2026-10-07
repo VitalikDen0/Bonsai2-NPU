@@ -241,6 +241,8 @@ static float* kvvs = NULL;
 static int g_ctx = 4096;
 static int g_dsp_ctx = 4096;
 static int g_turbo4 = 0;
+static float g_temp = 0.0f;
+static float g_top_p = 0.9f;
 static uint8_t* g_lin_aux = NULL;
 static int g_fused_lin = 1;
 static int g_fused_mlp = 1;
@@ -1415,7 +1417,7 @@ static int cdsp_lmhead_batch(const float* x, int B, float* logits) {
     static int s_force_4call = 0;
     if (s_force_4call && lm_calls_mode <= 2) lm_calls_mode = 4;
 
-    if (g_lm_static_cdsp && g_lm_bits && g_lm_scales && lm_calls_mode <= 2) {
+    if (g_temp <= 0.01f && g_lm_static_cdsp && g_lm_bits && g_lm_scales && lm_calls_mode <= 2) {
         int ok_2call = 1;
         for (int b = 0; b < B; b++) {
             memcpy(g_xs, x + (size_t)b * th->in, (size_t)th->in * sizeof(float));
@@ -1472,7 +1474,7 @@ static int cdsp_lmhead_batch(const float* x, int B, float* logits) {
         if (ok_2call) return 0;
     }
 
-    if (g_lm_static_cdsp && g_lm_bits && g_lm_scales && lm_calls_mode == 4) {
+    if (g_temp <= 0.01f && g_lm_static_cdsp && g_lm_bits && g_lm_scales && lm_calls_mode == 4) {
         for (int b = 0; b < B; b++) {
             memcpy(g_xs, x + (size_t)b * th->in, (size_t)th->in * sizeof(float));
             int b_fast_argmax_idx = -1;
@@ -1519,7 +1521,7 @@ static int cdsp_lmhead_batch(const float* x, int B, float* logits) {
         return 0;
     }
 
-    if (B == 1 && !g_lm_static_cdsp && chunk == 31040 && g_ring_arena_sz >= 177078272 && lm_calls_mode <= 2) {
+    if (g_temp <= 0.01f && B == 1 && !g_lm_static_cdsp && chunk == 31040 && g_ring_arena_sz >= 177078272 && lm_calls_mode <= 2) {
         memcpy(g_xs, x, (size_t)th->in * sizeof(float));
         const uint8_t* s_base = g_lm_scales ? (const uint8_t*)g_lm_scales : (g_base + th->off);
         const uint8_t* b_base = g_lm_bits ? g_lm_bits : (g_base + th->off + (size_t)th->out * ng * 2);
@@ -1585,7 +1587,7 @@ static int cdsp_lmhead_batch(const float* x, int B, float* logits) {
         }
     }
 
-    if (B == 1 && !g_lm_static_cdsp && chunk == 31040 && g_ring_arena_sz >= 88539136 && lm_calls_mode == 4) {
+    if (g_temp <= 0.01f && B == 1 && !g_lm_static_cdsp && chunk == 31040 && g_ring_arena_sz >= 88539136 && lm_calls_mode == 4) {
         memcpy(g_xs, x, (size_t)th->in * sizeof(float));
         const uint8_t* s_base = g_lm_scales ? (const uint8_t*)g_lm_scales : (g_base + th->off);
         const uint8_t* b_base = g_lm_bits ? g_lm_bits : (g_base + th->off + (size_t)th->out * ng * 2);
@@ -3242,6 +3244,65 @@ static inline int sample_argmax_token(const float* lgt) {
     return bi;
 }
 
+typedef struct {
+    float prob;
+    int id;
+} TokenCand;
+
+static inline int sample_top_p(const float* lgt, int n, float temp, float top_p) {
+    if (temp <= 0.01f) {
+        return sample_argmax_token(lgt);
+    }
+    float mx = -1e30f;
+    for (int i = 0; i < n; i++) {
+        if (lgt[i] > mx) mx = lgt[i];
+    }
+    float cutoff = mx - 10.0f * temp;
+    static TokenCand cands[2048];
+    int n_cand = 0;
+    for (int i = 0; i < n; i++) {
+        if (lgt[i] >= cutoff && n_cand < 2048) {
+            cands[n_cand].id = i;
+            cands[n_cand].prob = expf((lgt[i] - mx) / temp);
+            n_cand++;
+        }
+    }
+    if (n_cand <= 0) return sample_argmax_token(lgt);
+
+    for (int i = 1; i < n_cand; i++) {
+        TokenCand key = cands[i];
+        int j = i - 1;
+        while (j >= 0 && cands[j].prob < key.prob) {
+            cands[j + 1] = cands[j];
+            j--;
+        }
+        cands[j + 1] = key;
+    }
+
+    float total_p = 0.0f;
+    for (int i = 0; i < n_cand; i++) total_p += cands[i].prob;
+    float inv_p = (total_p > 0.0f) ? (1.0f / total_p) : 1.0f;
+    for (int i = 0; i < n_cand; i++) cands[i].prob *= inv_p;
+
+    float cum_p = 0.0f;
+    int cutoff_idx = n_cand;
+    for (int i = 0; i < n_cand; i++) {
+        cum_p += cands[i].prob;
+        if (cum_p >= top_p) {
+            cutoff_idx = i + 1;
+            break;
+        }
+    }
+
+    float r = ((float)rand() / (float)RAND_MAX) * cum_p;
+    float acc = 0.0f;
+    for (int i = 0; i < cutoff_idx; i++) {
+        acc += cands[i].prob;
+        if (r <= acc) return cands[i].id;
+    }
+    return cands[cutoff_idx - 1].id;
+}
+
 static int draft_prompt_lookup(const int* history, int n_hist, int* drafts, int max_drafts) {
     if (n_hist < 4 || max_drafts <= 0) return 0;
     for (int gram_len = 3; gram_len >= 2; gram_len--) {
@@ -3289,19 +3350,35 @@ int main(int argc, char** argv) {
     if (getenv("BONSAI_TURBO4")) {
         g_turbo4 = atoi(getenv("BONSAI_TURBO4")) ? 1 : 0;
     }
+    if (getenv("BONSAI_TEMP")) {
+        g_temp = atof(getenv("BONSAI_TEMP"));
+    }
+    if (getenv("BONSAI_TOP_P")) {
+        g_top_p = atof(getenv("BONSAI_TOP_P"));
+    }
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--turbo4") == 0) {
             g_turbo4 = 1;
+        }
+        if (strcmp(argv[i], "--temp") == 0 && i + 1 < argc) {
+            g_temp = atof(argv[i + 1]);
+        }
+        if (strcmp(argv[i], "--top-p") == 0 && i + 1 < argc) {
+            g_top_p = atof(argv[i + 1]);
         }
     }
     if (g_turbo4) {
         fprintf(stderr, "[fwd] TurboQuant / Turbo4 mode ENABLED (4-bit KV Cache: 16 KiB/token)\n");
     }
+    if (g_temp > 0.0f) {
+        srand((unsigned int)time(NULL));
+        fprintf(stderr, "[fwd] Stochastic Sampling ACTIVE: Temp=%.2f, Top-P=%.2f\n", g_temp, g_top_p);
+    }
     fprintf(stderr, "[fwd] start\n");
     if (argc < 4) {
-        printf("usage: bonsai_fwd model.npubin tok.bin \"prompt\" [nsteps] [ctx] [--turbo4]\n");
-        printf("       bonsai_fwd model.npubin tok.bin --chat [ctx] [--turbo4]\n");
-        printf("       bonsai_fwd model.npubin tok.bin --server [port] [ctx] [--turbo4]\n");
+        printf("usage: bonsai_fwd model.npubin tok.bin \"prompt\" [nsteps] [ctx] [--turbo4] [--temp T] [--top-p P]\n");
+        printf("       bonsai_fwd model.npubin tok.bin --chat [ctx] [--turbo4] [--temp T] [--top-p P]\n");
+        printf("       bonsai_fwd model.npubin tok.bin --server [port] [ctx] [--turbo4] [--temp T] [--top-p P]\n");
         return 2;
     }
     int is_chat   = (strcmp(argv[3], "--chat") == 0);
@@ -3422,10 +3499,10 @@ int main(int argc, char** argv) {
             if (forward_tokens_batch(vtoks, pos, 2, g_hidden_batch) == 0 &&
                 cdsp_lmhead_batch(g_hidden_batch, 2, logits) == 0) {
                 double b = now_ms();
-                int bi_0 = sample_argmax_token(logits);
+                int bi_0 = (g_temp <= 0.01f) ? sample_argmax_token(logits) : sample_top_p(logits, 248320, g_temp, g_top_p);
                 if (bi_0 == drafts[0]) {
                     // Match! Both tokens accepted!
-                    int bi_1 = sample_argmax_token(logits + 248320);
+                    int bi_1 = (g_temp <= 0.01f) ? sample_argmax_token(logits + 248320) : sample_top_p(logits + 248320, 248320, g_temp, g_top_p);
                     unsigned char dec0[256], dec1[256];
                     int nb0 = tok_decode(&bi_0, 1, dec0, sizeof(dec0));
                     int nb1 = tok_decode(&bi_1, 1, dec1, sizeof(dec1));
@@ -3453,17 +3530,15 @@ int main(int argc, char** argv) {
         // Pre-staged unchunked head (zero memcpy, single direct NPU call)
         if (cdsp_lmhead(hidden, logits)) { printf("HEAD FAIL\n"); return 1; }
         double b = now_ms();
-        // greedy + sanity
+        // greedy or top-p sample
         uint64_t u_arg0 = (g_profile_tree) ? now_us() : 0;
         int bi = 0, nan = 0;
-        if (g_fast_argmax_idx >= 0 && g_fast_argmax_idx < 248320) {
+        if (g_temp <= 0.01f && g_fast_argmax_idx >= 0 && g_fast_argmax_idx < 248320) {
             bi = g_fast_argmax_idx;
+        } else if (g_temp <= 0.01f) {
+            bi = sample_argmax_token(logits);
         } else {
-            for (int i = 0; i < 248320; i++) {
-                float v = logits[i];
-                if (!(v == v) || v > 1e10f || v < -1e10f) nan = 1;
-                if (v > logits[bi]) bi = v == v ? i : bi;
-            }
+            bi = sample_top_p(logits, 248320, g_temp, g_top_p);
         }
         if (g_profile_tree) {
             g_prof.t_argmax_us = now_us() - u_arg0;
