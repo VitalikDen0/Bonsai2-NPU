@@ -3,4 +3,7 @@
 // no farf symbols; all real DSP runtime symbols resolve on-device at load.
 #ifndef _HAP_FARF_H
 #define _HAP_FARF_H
+#define HAP_debug_v2 0
+#define FARF(level, ...) (void)0
+#define RUNTIME_ERROR 0
 #endif

@@ -364,6 +364,8 @@ int g_dsp_kv_ctx_max = 256;
 
 static float* g_dsp_ssm_conv = NULL;
 static float* g_dsp_ssm_rec = NULL;
+static float* g_dsp_ssm_conv_bak = NULL;
+static float* g_dsp_ssm_rec_bak = NULL;
 static unsigned char* g_dsp_lin_aux = NULL;
 static void* g_dsp_kvk_raw = NULL;
 static void* g_dsp_kvv_raw = NULL;
@@ -452,6 +454,13 @@ int bonsai_register_lin_states(remote_handle64 _h,
         if (!g_dsp_ssm_rec) return -12;
     }
     memset(g_dsp_ssm_rec, 0, rec_bytes);
+
+    if (!g_dsp_ssm_conv_bak) {
+        g_dsp_ssm_conv_bak = (float*)malloc(conv_bytes);
+    }
+    if (!g_dsp_ssm_rec_bak) {
+        g_dsp_ssm_rec_bak = (float*)malloc(rec_bytes);
+    }
 
     // Free previously allocated KV buffers if re-registering
     if (g_dsp_kvk_raw) { free(g_dsp_kvk_raw); g_dsp_kvk_raw = NULL; g_dsp_kvk = NULL; }
@@ -546,6 +555,18 @@ int bonsai_lin_layer_fused(remote_handle64 _h, int layer_idx,
     (void)gate_bitsLen; (void)gate_scalesLen;
     (void)down_bitsLen; (void)down_scalesLen;
     (void)yLen;
+    if (layer_idx == -500) {
+        if (!g_dsp_ssm_conv || !g_dsp_ssm_rec || !g_dsp_ssm_conv_bak || !g_dsp_ssm_rec_bak) return -500;
+        memcpy(g_dsp_ssm_conv_bak, g_dsp_ssm_conv, (size_t)48 * 10240 * 3 * sizeof(float));
+        memcpy(g_dsp_ssm_rec_bak,  g_dsp_ssm_rec,  (size_t)48 * 48 * 128 * 128 * sizeof(float));
+        return 0;
+    }
+    if (layer_idx == -501) {
+        if (!g_dsp_ssm_conv || !g_dsp_ssm_rec || !g_dsp_ssm_conv_bak || !g_dsp_ssm_rec_bak) return -501;
+        memcpy(g_dsp_ssm_conv, g_dsp_ssm_conv_bak, (size_t)48 * 10240 * 3 * sizeof(float));
+        memcpy(g_dsp_ssm_rec,  g_dsp_ssm_rec_bak,  (size_t)48 * 48 * 128 * 128 * sizeof(float));
+        return 0;
+    }
     if (!x || !out_bits || !out_scales ||
         !gate_bits || !gate_scales || !down_bits || !down_scales || !y) return -1;
     if (!g_dsp_ssm_conv || !g_dsp_ssm_rec || !g_dsp_lin_aux) return -2;

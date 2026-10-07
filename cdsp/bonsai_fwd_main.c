@@ -968,10 +968,9 @@ static int stage_init(void) {
 #else
         free(temp_lin_aux);
 #endif
-    } else {
-        if (!ssm_conv) ssm_conv = (float*)calloc((size_t)48 * 10240 * 3, sizeof(float));
-        if (!ssm_rec)  ssm_rec  = (float*)calloc((size_t)48 * 48 * 128 * 128, sizeof(float));
     }
+    if (!ssm_conv) ssm_conv = (float*)calloc((size_t)48 * 10240 * 3, sizeof(float));
+    if (!ssm_rec)  ssm_rec  = (float*)calloc((size_t)48 * 48 * 128 * 128, sizeof(float));
 
     size_t total_group_bytes = 0;
     int max_grp_layers = (g_static_layers <= 36 && (g_static_layers % 2 == 0) && !slay_env) ? (g_static_layers / 2) : 16;
@@ -1409,91 +1408,106 @@ static int cdsp_lmhead_batch(const float* x, int B, float* logits) {
     static int s_force_4call = 0;
     if (s_force_4call && lm_calls_mode <= 2) lm_calls_mode = 4;
 
-    if (B == 1 && g_lm_static_cdsp && g_lm_bits && g_lm_scales && lm_calls_mode <= 2) {
-        memcpy(g_xs, x, (size_t)th->in * sizeof(float));
+    if (g_lm_static_cdsp && g_lm_bits && g_lm_scales && lm_calls_mode <= 2) {
         int ok_2call = 1;
-        for (int h = 0; h < 2; h++) {
-            int r_base = h * 4 * 31040;
-            const uint8_t* b0 = g_lm_bits + (size_t)(r_base + 0 * 31040) * prow;
-            const uint8_t* b1 = g_lm_bits + (size_t)(r_base + 1 * 31040) * prow;
-            const uint8_t* b2 = g_lm_bits + (size_t)(r_base + 2 * 31040) * prow;
-            const uint8_t* b3 = g_lm_bits + (size_t)(r_base + 3 * 31040) * prow;
-            const short*   s0 = (const short*)g_lm_scales + (size_t)(r_base + 0 * 31040) * ng;
-            const short*   s1 = (const short*)g_lm_scales + (size_t)(r_base + 1 * 31040) * ng;
-            const short*   s2 = (const short*)g_lm_scales + (size_t)(r_base + 2 * 31040) * ng;
-            const short*   s3 = (const short*)g_lm_scales + (size_t)(r_base + 3 * 31040) * ng;
-            double t_r0 = now_ms();
-            uint64_t u_r0 = g_profile_tree ? now_us() : 0;
-            int rc_h = bonsai_lin_layer_fused(g_h, -100 - h,
-                                              g_xs, (int)th->in,
-                                              b0, 31040 * (int)prow, s0, 31040 * (int)ng,
-                                              b1, 31040 * (int)prow, s1, 31040 * (int)ng,
-                                              b2, 31040 * (int)prow, s2, 31040 * (int)ng,
-                                              b3, 31040 * (int)prow, s3, 31040 * (int)ng,
-                                              g_ys, 16);
-            double t_r1 = now_ms();
-            if (rc_h != 0) {
-                fprintf(stderr, "[fwd] 2-call static LM head h=%d returned rc=0x%x (%d), falling back to 4-call fused path\n", h, rc_h, rc_h);
-                s_force_4call = 1;
-                lm_calls_mode = 4;
-                ok_2call = 0;
-                g_fast_argmax_idx = -1;
-                break;
+        for (int b = 0; b < B; b++) {
+            memcpy(g_xs, x + (size_t)b * th->in, (size_t)th->in * sizeof(float));
+            int b_fast_argmax_idx = -1;
+            float b_fast_argmax_val = -1e30f;
+            for (int h = 0; h < 2; h++) {
+                int r_base = h * 4 * 31040;
+                const uint8_t* b0 = g_lm_bits + (size_t)(r_base + 0 * 31040) * prow;
+                const uint8_t* b1 = g_lm_bits + (size_t)(r_base + 1 * 31040) * prow;
+                const uint8_t* b2 = g_lm_bits + (size_t)(r_base + 2 * 31040) * prow;
+                const uint8_t* b3 = g_lm_bits + (size_t)(r_base + 3 * 31040) * prow;
+                const short*   s0 = (const short*)g_lm_scales + (size_t)(r_base + 0 * 31040) * ng;
+                const short*   s1 = (const short*)g_lm_scales + (size_t)(r_base + 1 * 31040) * ng;
+                const short*   s2 = (const short*)g_lm_scales + (size_t)(r_base + 2 * 31040) * ng;
+                const short*   s3 = (const short*)g_lm_scales + (size_t)(r_base + 3 * 31040) * ng;
+                double t_r0 = now_ms();
+                uint64_t u_r0 = (g_profile_tree && B == 1) ? now_us() : 0;
+                int rc_h = bonsai_lin_layer_fused(g_h, -100 - h,
+                                                  g_xs, (int)th->in,
+                                                  b0, 31040 * (int)prow, s0, 31040 * (int)ng,
+                                                  b1, 31040 * (int)prow, s1, 31040 * (int)ng,
+                                                  b2, 31040 * (int)prow, s2, 31040 * (int)ng,
+                                                  b3, 31040 * (int)prow, s3, 31040 * (int)ng,
+                                                  g_ys, 16);
+                double t_r1 = now_ms();
+                if (rc_h != 0) {
+                    fprintf(stderr, "[fwd] 2-call static LM head h=%d returned rc=0x%x (%d), falling back to 4-call fused path\n", h, rc_h, rc_h);
+                    s_force_4call = 1;
+                    lm_calls_mode = 4;
+                    ok_2call = 0;
+                    b_fast_argmax_idx = -1;
+                    break;
+                }
+                g_t_rpc += (t_r1 - t_r0);
+                g_calls_rpc++;
+                if (g_profile_tree && B == 1) g_prof.t_lmhead_rpc_us += (now_us() - u_r0);
+                float v = g_ys[0];
+                int32_t idx = 0;
+                memcpy(&idx, &g_ys[1], 4);
+                if (b_fast_argmax_idx < 0 || v > b_fast_argmax_val) {
+                    b_fast_argmax_val = v;
+                    b_fast_argmax_idx = idx;
+                }
             }
-            g_t_rpc += (t_r1 - t_r0);
-            g_calls_rpc++;
-            if (g_profile_tree) g_prof.t_lmhead_rpc_us += (now_us() - u_r0);
-            float v = g_ys[0];
-            int32_t idx = 0;
-            memcpy(&idx, &g_ys[1], 4);
-            if (g_fast_argmax_idx < 0 || v > g_fast_argmax_val) {
-                g_fast_argmax_val = v;
-                g_fast_argmax_idx = idx;
+            if (!ok_2call) break;
+            if (b == 0) {
+                g_fast_argmax_val = b_fast_argmax_val;
+                g_fast_argmax_idx = b_fast_argmax_idx;
+            }
+            if (b_fast_argmax_idx >= 0 && b_fast_argmax_idx < 248320) {
+                logits[(size_t)b * th->out + b_fast_argmax_idx] = b_fast_argmax_val;
             }
         }
-        if (ok_2call && g_fast_argmax_idx >= 0 && g_fast_argmax_idx < 248320) {
-            logits[g_fast_argmax_idx] = g_fast_argmax_val;
-            return 0;
-        }
+        if (ok_2call) return 0;
     }
 
-    if (B == 1 && g_lm_static_cdsp && g_lm_bits && g_lm_scales && lm_calls_mode == 4) {
-        memcpy(g_xs, x, (size_t)th->in * sizeof(float));
-        g_fast_argmax_idx = -1;
-        for (int h = 0; h < 4; h++) {
-            int r_base = h * 2 * 31040;
-            const uint8_t* b0 = g_lm_bits + (size_t)(r_base + 0 * 31040) * prow;
-            const uint8_t* b1 = g_lm_bits + (size_t)(r_base + 1 * 31040) * prow;
-            const short*   s0 = (const short*)g_lm_scales + (size_t)(r_base + 0 * 31040) * ng;
-            const short*   s1 = (const short*)g_lm_scales + (size_t)(r_base + 1 * 31040) * ng;
-            double t_r0 = now_ms();
-            uint64_t u_r0 = g_profile_tree ? now_us() : 0;
-            int rc_h = bonsai_lin_layer_fused(g_h, -200 - h,
-                                              g_xs, (int)th->in,
-                                              b0, 31040 * (int)prow, s0, 31040 * (int)ng,
-                                              b1, 31040 * (int)prow, s1, 31040 * (int)ng,
-                                              b0, 128, (const short*)s0, 64,
-                                              b0, 128, (const short*)s0, 64,
-                                              g_ys, 16);
-            double t_r1 = now_ms();
-            g_t_rpc += (t_r1 - t_r0);
-            g_calls_rpc++;
-            if (g_profile_tree) g_prof.t_lmhead_rpc_us += (now_us() - u_r0);
-            if (rc_h != 0) {
-                fprintf(stderr, "[fwd] 4-call static LM head h=%d failed rc=0x%x (%d)\n", h, rc_h, rc_h);
-                g_fast_argmax_idx = -1;
-                return rc_h;
+    if (g_lm_static_cdsp && g_lm_bits && g_lm_scales && lm_calls_mode == 4) {
+        for (int b = 0; b < B; b++) {
+            memcpy(g_xs, x + (size_t)b * th->in, (size_t)th->in * sizeof(float));
+            int b_fast_argmax_idx = -1;
+            float b_fast_argmax_val = -1e30f;
+            for (int h = 0; h < 4; h++) {
+                int r_base = h * 2 * 31040;
+                const uint8_t* b0 = g_lm_bits + (size_t)(r_base + 0 * 31040) * prow;
+                const uint8_t* b1 = g_lm_bits + (size_t)(r_base + 1 * 31040) * prow;
+                const short*   s0 = (const short*)g_lm_scales + (size_t)(r_base + 0 * 31040) * ng;
+                const short*   s1 = (const short*)g_lm_scales + (size_t)(r_base + 1 * 31040) * ng;
+                double t_r0 = now_ms();
+                uint64_t u_r0 = (g_profile_tree && B == 1) ? now_us() : 0;
+                int rc_h = bonsai_lin_layer_fused(g_h, -200 - h,
+                                                  g_xs, (int)th->in,
+                                                  b0, 31040 * (int)prow, s0, 31040 * (int)ng,
+                                                  b1, 31040 * (int)prow, s1, 31040 * (int)ng,
+                                                  b0, 128, (const short*)s0, 64,
+                                                  b0, 128, (const short*)s0, 64,
+                                                  g_ys, 16);
+                double t_r1 = now_ms();
+                g_t_rpc += (t_r1 - t_r0);
+                g_calls_rpc++;
+                if (g_profile_tree && B == 1) g_prof.t_lmhead_rpc_us += (now_us() - u_r0);
+                if (rc_h != 0) {
+                    fprintf(stderr, "[fwd] 4-call static LM head h=%d failed rc=0x%x (%d)\n", h, rc_h, rc_h);
+                    return rc_h;
+                }
+                float v = g_ys[0];
+                int32_t idx = 0;
+                memcpy(&idx, &g_ys[1], 4);
+                if (b_fast_argmax_idx < 0 || v > b_fast_argmax_val) {
+                    b_fast_argmax_val = v;
+                    b_fast_argmax_idx = idx;
+                }
             }
-            float v = g_ys[0];
-            int32_t idx = 0;
-            memcpy(&idx, &g_ys[1], 4);
-            if (g_fast_argmax_idx < 0 || v > g_fast_argmax_val) {
-                g_fast_argmax_val = v;
-                g_fast_argmax_idx = idx;
+            if (b == 0) {
+                g_fast_argmax_val = b_fast_argmax_val;
+                g_fast_argmax_idx = b_fast_argmax_idx;
             }
-        }
-        if (g_fast_argmax_idx >= 0 && g_fast_argmax_idx < 248320) {
-            logits[g_fast_argmax_idx] = g_fast_argmax_val;
+            if (b_fast_argmax_idx >= 0 && b_fast_argmax_idx < 248320) {
+                logits[(size_t)b * th->out + b_fast_argmax_idx] = b_fast_argmax_val;
+            }
         }
         return 0;
     }
@@ -2366,7 +2380,7 @@ static int forward_tokens_batch(const int* toks, int start_pos, int B, float* ou
         }
 
 #ifndef _WIN32
-        if (is_lin && g_fused_lin && g_fused_mlp && B == 1 && (g_fused_layer >= 2 || (g_fused_layer == 1 && is_static))) {
+        if (is_lin && g_fused_lin && g_fused_mlp && (g_fused_layer >= 2 || (g_fused_layer == 1 && is_static))) {
             int li = L - (L >> 2);
             int c0 = 4 * L + 0;
             int c1 = 4 * L + 1;
@@ -2403,31 +2417,34 @@ static int forward_tokens_batch(const int* toks, int start_pos, int B, float* ou
                 b2 = g_bits_buf[buf2]; s2 = (const short*)g_scales_buf[buf2];
                 b3 = g_bits_buf[buf3]; s3 = (const short*)g_scales_buf[buf3];
             }
-            if (g_profile_tree) {
+            if (g_profile_tree && B == 1) {
                 g_prof.layers[L].c0.t_wait_us = u_lwait;
             }
 
-            memcpy(g_xs, h_b, HIDDEN * sizeof(float));
+            for (int b = 0; b < B; b++) {
+                memcpy(g_xs, h_b + (size_t)b * HIDDEN, HIDDEN * sizeof(float));
 
-            double t_r0 = now_ms();
-            uint64_t u_lrpc0 = g_profile_tree ? now_us() : 0;
-            int rc_layer = bonsai_lin_layer_fused(g_h, li,
-                                                  g_xs, HIDDEN,
-                                                  b0, 16384 * 1280, s0, 16384 * 40,
-                                                  b1, 5120 * 1536,  s1, 5120 * 48,
-                                                  b2, 34816 * 1280, s2, 34816 * 40,
-                                                  b3, 5120 * 4352,  s3, 5120 * 136,
-                                                  g_ys, HIDDEN);
-            double t_r1 = now_ms();
-            g_t_rpc += (t_r1 - t_r0);
-            g_calls_rpc++;
-            if (g_profile_tree) {
-                g_prof.layers[L].c0.t_rpc_us = now_us() - u_lrpc0;
-                g_prof.layers[L].c0.t_total_us = g_prof.layers[L].c0.t_wait_us + g_prof.layers[L].c0.t_rpc_us;
-            }
-            if (rc_layer != 0) {
-                printf("bonsai_lin_layer_fused L=%d li=%d err rc=%d\n", L, li, rc_layer);
-                return rc_layer;
+                double t_r0 = now_ms();
+                uint64_t u_lrpc0 = (g_profile_tree && B == 1) ? now_us() : 0;
+                int rc_layer = bonsai_lin_layer_fused(g_h, li,
+                                                      g_xs, HIDDEN,
+                                                      b0, 16384 * 1280, s0, 16384 * 40,
+                                                      b1, 5120 * 1536,  s1, 5120 * 48,
+                                                      b2, 34816 * 1280, s2, 34816 * 40,
+                                                      b3, 5120 * 4352,  s3, 5120 * 136,
+                                                      g_ys, HIDDEN);
+                double t_r1 = now_ms();
+                g_t_rpc += (t_r1 - t_r0);
+                g_calls_rpc++;
+                if (g_profile_tree && B == 1) {
+                    g_prof.layers[L].c0.t_rpc_us = now_us() - u_lrpc0;
+                    g_prof.layers[L].c0.t_total_us = g_prof.layers[L].c0.t_wait_us + g_prof.layers[L].c0.t_rpc_us;
+                }
+                if (rc_layer != 0) {
+                    printf("bonsai_lin_layer_fused L=%d li=%d err rc=%d\n", L, li, rc_layer);
+                    return rc_layer;
+                }
+                memcpy(h_b + (size_t)b * HIDDEN, g_ys, HIDDEN * sizeof(float));
             }
             g_cur_call += 4;
             if (!is_static_l) {
@@ -2436,13 +2453,12 @@ static int forward_tokens_batch(const int* toks, int start_pos, int B, float* ou
                 sem_post(&g_sem_free[buf2]);
                 sem_post(&g_sem_free[buf3]);
             }
-            memcpy(h_b, g_ys, HIDDEN * sizeof(float));
-            if (g_profile_tree) {
+            if (g_profile_tree && B == 1) {
                 g_prof.layers[L].t_layer_total_us = now_us() - u_layer_start;
             }
             continue;
         }
-        if (!is_lin && B == 1 && g_fused_lin && g_fused_mlp &&
+        if (!is_lin && g_fused_lin && g_fused_mlp &&
             (g_fused_layer == 2 || (g_fused_layer == 1 && is_static))) {
             int fi = L >> 2;
             int c0 = 4 * L + 0;
@@ -2460,7 +2476,7 @@ static int forward_tokens_batch(const int* toks, int start_pos, int B, float* ou
                 s_fused_full = (!ff_env || atoi(ff_env) != 0) ? 1 : 0;
             }
 
-            if (s_fused_full && start_pos >= 0 && start_pos < g_dsp_ctx) {
+            if (s_fused_full && start_pos >= 0 && (start_pos + B - 1) < g_dsp_ctx) {
                 uint64_t u_lwait = 0;
                 if (is_static_l) {
                     b0 = g_call_static_bits[c0]; s0 = (const short*)g_call_static_scales[c0];
@@ -2487,31 +2503,35 @@ static int forward_tokens_batch(const int* toks, int start_pos, int B, float* ou
                     b2 = g_bits_buf[buf2]; s2 = (const short*)g_scales_buf[buf2];
                     b3 = g_bits_buf[buf3]; s3 = (const short*)g_scales_buf[buf3];
                 }
-                if (g_profile_tree) {
+                if (g_profile_tree && B == 1) {
                     g_prof.layers[L].c0.t_wait_us = u_lwait;
                 }
 
-                memcpy(g_xs, h_b, HIDDEN * sizeof(float));
+                for (int b = 0; b < B; b++) {
+                    int cur_pos = start_pos + b;
+                    memcpy(g_xs, h_b + (size_t)b * HIDDEN, HIDDEN * sizeof(float));
 
-                double t_r0 = now_ms();
-                uint64_t u_lrpc0 = g_profile_tree ? now_us() : 0;
-                int rc_full = bonsai_lin_layer_fused(g_h, -10000 - (start_pos * 16 + fi),
-                                                     g_xs, HIDDEN,
-                                                     b0, 14336 * 1280, s0, 14336 * 40,
-                                                     b1, 5120 * 1536,  s1, 5120 * 48,
-                                                     b2, 34816 * 1280, s2, 34816 * 40,
-                                                     b3, 5120 * 4352,  s3, 5120 * 136,
-                                                     g_ys, HIDDEN);
-                double t_r1 = now_ms();
-                g_t_rpc += (t_r1 - t_r0);
-                g_calls_rpc++;
-                if (g_profile_tree) {
-                    g_prof.layers[L].c0.t_rpc_us = now_us() - u_lrpc0;
-                    g_prof.layers[L].c0.t_total_us = g_prof.layers[L].c0.t_wait_us + g_prof.layers[L].c0.t_rpc_us;
-                }
-                if (rc_full != 0) {
-                    printf("bonsai_lin_layer_fused(full 1-call) L=%d fi=%d pos=%d err rc=%d\n", L, fi, start_pos, rc_full);
-                    return rc_full;
+                    double t_r0 = now_ms();
+                    uint64_t u_lrpc0 = (g_profile_tree && B == 1) ? now_us() : 0;
+                    int rc_full = bonsai_lin_layer_fused(g_h, -10000 - (cur_pos * 16 + fi),
+                                                         g_xs, HIDDEN,
+                                                         b0, 14336 * 1280, s0, 14336 * 40,
+                                                         b1, 5120 * 1536,  s1, 5120 * 48,
+                                                         b2, 34816 * 1280, s2, 34816 * 40,
+                                                         b3, 5120 * 4352,  s3, 5120 * 136,
+                                                         g_ys, HIDDEN);
+                    double t_r1 = now_ms();
+                    g_t_rpc += (t_r1 - t_r0);
+                    g_calls_rpc++;
+                    if (g_profile_tree && B == 1) {
+                        g_prof.layers[L].c0.t_rpc_us = now_us() - u_lrpc0;
+                        g_prof.layers[L].c0.t_total_us = g_prof.layers[L].c0.t_wait_us + g_prof.layers[L].c0.t_rpc_us;
+                    }
+                    if (rc_full != 0) {
+                        printf("bonsai_lin_layer_fused(full 1-call) L=%d fi=%d pos=%d err rc=%d\n", L, fi, cur_pos, rc_full);
+                        return rc_full;
+                    }
+                    memcpy(h_b + (size_t)b * HIDDEN, g_ys, HIDDEN * sizeof(float));
                 }
                 g_cur_call += 4;
                 if (!is_static_l) {
@@ -2520,8 +2540,7 @@ static int forward_tokens_batch(const int* toks, int start_pos, int B, float* ou
                     sem_post(&g_sem_free[buf2]);
                     sem_post(&g_sem_free[buf3]);
                 }
-                memcpy(h_b, g_ys, HIDDEN * sizeof(float));
-                if (g_profile_tree) {
+                if (g_profile_tree && B == 1) {
                     g_prof.layers[L].t_layer_total_us = now_us() - u_layer_start;
                 }
                 continue;
@@ -3208,6 +3227,37 @@ static void reset_engine_states(void) {
 #endif
 }
 
+static inline int sample_argmax_token(const float* lgt) {
+    int bi = 0;
+    for (int i = 1; i < 248320; i++) {
+        if (lgt[i] > lgt[bi]) bi = i;
+    }
+    return bi;
+}
+
+static int draft_prompt_lookup(const int* history, int n_hist, int* drafts, int max_drafts) {
+    if (n_hist < 4 || max_drafts <= 0) return 0;
+    for (int gram_len = 3; gram_len >= 2; gram_len--) {
+        if (n_hist < gram_len + 1) continue;
+        const int* target = history + n_hist - gram_len;
+        for (int i = n_hist - gram_len - 1; i >= 0; i--) {
+            int match = 1;
+            for (int k = 0; k < gram_len; k++) {
+                if (history[i + k] != target[k]) { match = 0; break; }
+            }
+            if (match) {
+                int found = 0;
+                int src = i + gram_len;
+                while (src < n_hist && found < max_drafts) {
+                    drafts[found++] = history[src++];
+                }
+                if (found > 0) return found;
+            }
+        }
+    }
+    return 0;
+}
+
 #include "bonsai_server.h"
 
 int main(int argc, char** argv) {
@@ -3329,16 +3379,59 @@ int main(int argc, char** argv) {
     printf("prefill %d toks in %.1f ms (%.1f ms/tok)\n",
            n_prefill, t1 - t0, n_prefill > 0 ? (t1 - t0) / n_prefill : 0.0);
 
+    static int gen_hist[8192];
+    int n_gen = nids;
+    for (int i = 0; i < nids; i++) gen_hist[i] = ids[i];
+
+    const char* mtp_env = getenv("BONSAI_MTP");
+    int mtp_active = (mtp_env && atoi(mtp_env) != 0);
+    if (mtp_active) {
+        printf("[fwd] Multi-Token Prediction (MTP / Prompt Lookup Speculative Decoding) ENABLED\n");
+    }
+
     int cur = ids[nids - 1];
     g_t_rpc = 0; g_t_memcpy = 0; g_t_trans = 0; g_calls_rpc = 0;
-    for (int s = 0; s < nsteps; s++) {
+    int s = 0;
+    while (s < nsteps) {
+        int pos = (nids - 1) + s;
+        int drafts[2];
+        int n_draft = (mtp_active && s + 1 < nsteps) ? draft_prompt_lookup(gen_hist, n_gen, drafts, 1) : 0;
+
+        if (n_draft > 0) {
+            // MTP speculative branch with B = 2
+            int vtoks[2] = { cur, drafts[0] };
+            double a = now_ms();
+            if (forward_tokens_batch(vtoks, pos, 2, g_hidden_batch) == 0 &&
+                cdsp_lmhead_batch(g_hidden_batch, 2, logits) == 0) {
+                double b = now_ms();
+                int bi_0 = sample_argmax_token(logits);
+                if (bi_0 == drafts[0]) {
+                    // Match! Both tokens accepted!
+                    int bi_1 = sample_argmax_token(logits + 248320);
+                    unsigned char dec0[256], dec1[256];
+                    int nb0 = tok_decode(&bi_0, 1, dec0, sizeof(dec0));
+                    int nb1 = tok_decode(&bi_1, 1, dec1, sizeof(dec1));
+                    dec0[nb0 < 0 ? 0 : (nb0 > 255 ? 255 : nb0)] = 0;
+                    dec1[nb1 < 0 ? 0 : (nb1 > 255 ? 255 : nb1)] = 0;
+                    printf("step %d [MTP 2x MATCH] tok0=%d (%s) tok1=%d (%s) total=%.0fms (%.1f ms/tok = %.2f tok/s | NPU_RPC=%.0fms [%d calls])\n",
+                           s, bi_0, (const char*)dec0, bi_1, (const char*)dec1, b - a, (b - a) / 2.0, 2000.0 / (b - a), g_t_rpc, g_calls_rpc);
+                    gen_hist[n_gen++] = bi_0;
+                    gen_hist[n_gen++] = bi_1;
+                    cur = bi_1;
+                    s += 2;
+                    g_t_rpc = 0; g_t_memcpy = 0; g_t_trans = 0; g_calls_rpc = 0;
+                    continue;
+                }
+            }
+        }
+
         uint64_t u_tok_start = 0;
         if (g_profile_tree) {
             memset(&g_prof, 0, sizeof(g_prof));
             u_tok_start = now_us();
         }
         double a = now_ms();
-        if (forward_token(cur, (nids - 1) + s)) { printf("DECODE FAIL at %d\n", s); return 1; }
+        if (forward_token(cur, pos)) { printf("DECODE FAIL at %d\n", s); return 1; }
         // Pre-staged unchunked head (zero memcpy, single direct NPU call)
         if (cdsp_lmhead(hidden, logits)) { printf("HEAD FAIL\n"); return 1; }
         double b = now_ms();
@@ -3373,8 +3466,10 @@ int main(int argc, char** argv) {
         if (g_profile_tree && s == 0) {
             print_profile_tree(&g_prof, s);
         }
+        gen_hist[n_gen++] = bi;
         g_t_rpc = 0; g_t_memcpy = 0; g_t_trans = 0; g_calls_rpc = 0;
         cur = bi;
+        s++;
     }
 
     const char* vbatch_env = getenv("BONSAI_VERIFY_BATCH");
