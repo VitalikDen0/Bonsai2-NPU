@@ -30,12 +30,32 @@
 
 | Режим работы | Размер батча (B) | Задержка шага | Эффективная скорость | Утилизация кремния |
 | :--- | :---: | :---: | :---: | :---: |
-| **Базовый Decode** | B = 1 | 345 мс | 2.90 tok/s | 81.1% физического предела шины DRAM |
-| **MTP Пакетная верификация** | B = 4 | 380 мс | 10.52 tok/s | Веса читаются 1 раз на 4 токена |
-| **MTP Спекулятивная генерация** | Переменный | — | **5.5–8.0 tok/s** | При среднем проценте принятия 70–80% |
-| **Prefill Throughput** | B = 8 | 88 мс/ток | 11.36 tok/s | Пакетный GEMV |
+| **Базовый Decode** | B = 1 | 345–349 мс | 2.87–2.90 tok/s | 81.1% физического предела шины DRAM |
+| **MTP 2x Принятый шаг** | B = 2 | 407–418 мс (203.5 мс/ток) | **4.79–4.91 tok/s** | Двухтокенное регистровое ядро HVX |
+| **MTP 4x Принятый шаг** | B = 4 | 612 мс (153.0 мс/ток) | **6.54 tok/s** | Веса + матрица $S_h$ читаются 1 раз на 4 токена |
+| **MTP Сквозная генерация** | B = 1..4 | 166.4 мс/ток (средн.) | **6.01 tok/s** | Прогон 20 токенов (`avg 3.33 tok/step`) |
+| **Prefill Throughput** | B = 4 | 160.1–166.5 мс/ток | **6.01–6.25 tok/s** | Слитый 64-слойный пакетный GEMM + DeltaNet |
 
-*Тестовое устройство: OnePlus 13 (Snapdragon 8 Elite, 16 ГБ LPDDR5X @ 106.7 ГБ/с пиковой пропускной способности, DSP Hexagon v79).*
+*Тестовое устройство: OnePlus 13 (Snapdragon 8 Elite, 16 ГБ LPDDR5X @ 106.7 ГБ/с пиковой пропускной способности, DSP Hexagon v79). Полная хронология оптимизаций от скалярного C++ (52 сек/GEMV) до 6.54 tok/s приведена в [OPTIMIZATION_HISTORY.md](OPTIMIZATION_HISTORY.md).*
+
+### Подтвержденный лог замера на устройстве (`OnePlus 13`, `--turbo4 --temp 0.6 --top-p 0.9`)
+
+```text
+[fwd] TurboQuant / Turbo4 mode ENABLED (4-bit KV Cache: 16 KiB/token)
+[fwd] Stochastic Sampling ACTIVE: Temp=0.60, Top-P=0.90
+[fwd] Hybrid Engine Ready: 30 Static Layers (2.82 GiB) + Static LM Head (322 MB) + 34 Streamed Layers (Ring Arena 194 MB)
+prompt tokens=19
+prefill 18 toks in 2997.1 ms (166.5 ms/tok)
+[fwd] Multi-Token Prediction (MTP / Speculative Decoding, max_drafts=3) ENABLED
+step 0..3  [MTP 4x MATCH!] tok0=11751( Paris) tok1=13(.) tok2=561( The) tok3=6511( capital) total=665ms (166.3 ms/tok = 6.01 tok/s | NPU_RPC=660ms [66 calls])
+step 4..5  [MTP 2x MATCH!] tok0=314( of) tok1=9564( Germany) total=418ms (208.9 ms/tok = 4.79 tok/s | NPU_RPC=406ms [66 calls])
+step 6..9  [MTP 4x MATCH!] tok0=369( is) tok1=19241( Berlin) tok2=13(.) tok3=561( The) total=612ms (153.0 ms/tok = 6.54 tok/s | NPU_RPC=609ms [66 calls])
+step 10..13 [MTP 4x MATCH!] tok0=6511( capital) tok1=314( of) tok2=9338( France) tok3=369( is) total=612ms (153.1 ms/tok = 6.53 tok/s | NPU_RPC=610ms [66 calls])
+step 14..17 [MTP 4x MATCH!] tok0=11751( Paris) tok1=13(.) tok2=561( The) tok3=6511( capital) total=614ms (153.6 ms/tok = 6.51 tok/s | NPU_RPC=612ms [66 calls])
+step 18..19 [MTP 2x MATCH!] tok0=314( of) tok1=9564( Germany) total=407ms (203.5 ms/tok = 4.91 tok/s | NPU_RPC=401ms [66 calls])
+
+[SUMMARY] Generated 20 tokens in 6 NPU steps (3328.9 ms total = 166.4 ms/tok = 6.01 tok/s | avg 3.33 tok/step)
+```
 
 ---
 
@@ -52,6 +72,7 @@
 │   ├── tok.c                 # Быстрый BPE токенизатор на C
 │   └── ucat.c                # Таблицы категорий Unicode
 ├── repack_bonsai2_npu.py     # Сериализатор весов и упаковщик NPU-бинарника
+├── OPTIMIZATION_HISTORY.md   # Инженерная история оптимизаций от скалярного C++ до 6.54 tok/s (EN)
 ├── ARCHITECTURE.md           # Детальный технический разбор архитектуры (EN)
 ├── ARCHITECTURE_RU.md        # Детальный технический разбор архитектуры (RU)
 ├── README.md                 # Документация проекта (EN)

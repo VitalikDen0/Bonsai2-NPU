@@ -30,12 +30,32 @@ The engine operates via a monolithic 3.4 GB SMMU mapping, entirely bypassing tra
 
 | Mode | Batch Size (B) | Latency / Step | Effective Throughput | Hardware Utilization |
 | :--- | :---: | :---: | :---: | :---: |
-| **Standard Decode** | B = 1 | 345 ms | 2.90 tok/s | 81.1% of DRAM Bandwidth Limit |
-| **MTP Batch Verify** | B = 4 | 380 ms | 10.52 tok/s | Weights loaded once per 4 tokens |
-| **MTP Speculative Decode** | Variable | — | **5.5–8.0 tok/s** | Expected acceptance rate 70–80% |
-| **Prefill Throughput** | B = 8 | 88 ms/tok | 11.36 tok/s | Fused GEMV batching |
+| **Standard Decode** | B = 1 | 345–349 ms | 2.87–2.90 tok/s | 81.1% of DRAM Bandwidth Limit |
+| **MTP 2x Accepted Step** | B = 2 | 407–418 ms (203.5 ms/tok) | **4.79–4.91 tok/s** | Dual-token register-blocked HVX |
+| **MTP 4x Accepted Step** | B = 4 | 612 ms (153.0 ms/tok) | **6.54 tok/s** | Weights + DeltaNet $S_h$ streamed once per 4 tokens |
+| **MTP Sustained Decode** | B = 1..4 | 166.4 ms/tok avg | **6.01 tok/s** | Verified 20-token run (`avg 3.33 tok/step`) |
+| **Prefill Throughput** | B = 4 | 160.1–166.5 ms/tok | **6.01–6.25 tok/s** | Fused 64-layer GEMM + DeltaNet batching |
 
-*Hardware: OnePlus 13 (Snapdragon 8 Elite, 16 GB LPDDR5X @ 106.7 GB/s peak bandwidth, Hexagon v79 DSP).*
+*Hardware: OnePlus 13 (Snapdragon 8 Elite, 16 GB LPDDR5X @ 106.7 GB/s peak bandwidth, Hexagon v79 DSP). See [OPTIMIZATION_HISTORY.md](OPTIMIZATION_HISTORY.md) for the full progression from the 52 s/GEMV scalar C++ baseline to 6.54 tok/s.*
+
+### Verified On-Device Benchmark Log (`OnePlus 13`, `--turbo4 --temp 0.6 --top-p 0.9`)
+
+```text
+[fwd] TurboQuant / Turbo4 mode ENABLED (4-bit KV Cache: 16 KiB/token)
+[fwd] Stochastic Sampling ACTIVE: Temp=0.60, Top-P=0.90
+[fwd] Hybrid Engine Ready: 30 Static Layers (2.82 GiB) + Static LM Head (322 MB) + 34 Streamed Layers (Ring Arena 194 MB)
+prompt tokens=19
+prefill 18 toks in 2997.1 ms (166.5 ms/tok)
+[fwd] Multi-Token Prediction (MTP / Speculative Decoding, max_drafts=3) ENABLED
+step 0..3  [MTP 4x MATCH!] tok0=11751( Paris) tok1=13(.) tok2=561( The) tok3=6511( capital) total=665ms (166.3 ms/tok = 6.01 tok/s | NPU_RPC=660ms [66 calls])
+step 4..5  [MTP 2x MATCH!] tok0=314( of) tok1=9564( Germany) total=418ms (208.9 ms/tok = 4.79 tok/s | NPU_RPC=406ms [66 calls])
+step 6..9  [MTP 4x MATCH!] tok0=369( is) tok1=19241( Berlin) tok2=13(.) tok3=561( The) total=612ms (153.0 ms/tok = 6.54 tok/s | NPU_RPC=609ms [66 calls])
+step 10..13 [MTP 4x MATCH!] tok0=6511( capital) tok1=314( of) tok2=9338( France) tok3=369( is) total=612ms (153.1 ms/tok = 6.53 tok/s | NPU_RPC=610ms [66 calls])
+step 14..17 [MTP 4x MATCH!] tok0=11751( Paris) tok1=13(.) tok2=561( The) tok3=6511( capital) total=614ms (153.6 ms/tok = 6.51 tok/s | NPU_RPC=612ms [66 calls])
+step 18..19 [MTP 2x MATCH!] tok0=314( of) tok1=9564( Germany) total=407ms (203.5 ms/tok = 4.91 tok/s | NPU_RPC=401ms [66 calls])
+
+[SUMMARY] Generated 20 tokens in 6 NPU steps (3328.9 ms total = 166.4 ms/tok = 6.01 tok/s | avg 3.33 tok/step)
+```
 
 ---
 
@@ -52,6 +72,7 @@ The engine operates via a monolithic 3.4 GB SMMU mapping, entirely bypassing tra
 │   ├── tok.c                 # Fast C BPE tokenizer implementation
 │   └── ucat.c                # Unicode categorization tables
 ├── repack_bonsai2_npu.py     # NPU binary packager and format serializer
+├── OPTIMIZATION_HISTORY.md   # Engineering progression from Scalar C++ to 6.54 tok/s (EN)
 ├── ARCHITECTURE.md           # Deep-dive architecture and hardware specification (EN)
 ├── ARCHITECTURE_RU.md        # Deep-dive architecture and hardware specification (RU)
 ├── README.md                 # Project overview and deployment guide (EN)
