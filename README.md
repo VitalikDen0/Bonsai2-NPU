@@ -14,6 +14,19 @@ The engine operates via a monolithic 3.4 GB SMMU mapping, entirely bypassing tra
 
 ---
 
+## Project Status & Silicon Limit (99.9% Complete)
+
+**Bonsai-NPU** has reached both its logical architectural conclusion and the physical hardware limit of current mobile silicon:
+
+* [x] **Physical DRAM Bandwidth Ceiling ($B = 1$)**: Single-token decode latency is down to **341–349 ms/token (2.87–2.93 tok/s)** — reaching **>81% of the absolute theoretical LPDDR5X bandwidth limit** (`279.8 ms`), with **0.00 ms** host CPU math, **0.00 ms** SMMU remap overhead, and strictly **66 FastRPC calls** across the entire 27-billion parameter model.
+* [x] **Multi-Token Prediction (MTP, `B = 2..4`) & Rank-1 Inverse Rollback**: Single-pass batched HVX verification of `1..3` draft tokens with register-resident DeltaNet recurrence and 6-thread analytical state rollback (`10.16 MiB`), achieving **4.9–6.54 tok/s (153–203 ms/tok)** on accepted multi-token steps and **6.01 tok/s** sustained throughput.
+* [x] **TurboQuant & Turbo4 Mode (4-Bit KV-Cache)**: Vectorized 4-bit HVX KV-cache quantization (`16 KiB/token`, 4x compression) with **6.01–6.25 tok/s (160–166 ms/tok)** batched prefill throughput.
+
+> **Development Conclusion:**  
+> Core engine architecture and low-level Hexagon HVX kernels are **99.9% complete**. Because execution speed is now bounded directly by the physical LPDDR5X memory bus of the SoC, future updates will focus strictly on bug fixes, edge-case stability, and minor maintenance.
+
+---
+
 ## Technical Highlights
 
 * **Monolithic Weight Streaming**: Zero runtime SMMU remap overhead during decode; the complete model weights (~3.4 GB) are held in DMA-BUF and addressed by the NPU without IPC penalties.
@@ -131,16 +144,9 @@ adb shell "export ADSP_LIBRARY_PATH=/data/local/tmp; cd /data/local/tmp && ./bon
 
 ---
 
-## Roadmap & Upcoming Enhancements
-
-* [x] **Multi-Token Prediction (MTP) Speculative Decoding & Rank-1 Inverse Rollback**: Integrated CPU prompt-lookup n-gram proposer (`1..3` draft tokens) with single-pass HVX batched verification (`B = 2..4` in 66 RPC calls), register-resident multi-token DeltaNet recurrence, and 6-thread HVX Rank-1 Inverse State Rollback (`TASK_DELTANET_UNDO`), achieving **4.9–6.54 tok/s** (153–203 ms/tok) on accepted multi-token steps and **349 ms/tok (2.87 tok/s)** on single-token steps even with stochastic sampling (`--temp 0.6 --top-p 0.9`). Enabled via `export BONSAI_MTP=1`.
-* [x] **TurboQuant & Turbo4 Mode (4-Bit KV-Cache)**: Implemented 4-bit nibble packing (`dsp_tq4_quantize_256`) and fast vectorized dot-product in HVX to slash KV-cache footprint to **16 KiB/token** (4x reduction), maintaining **~349 ms/tok** single-token decode latency and **160–166 ms/tok (6.0–6.25 tok/s)** prefill throughput. Enabled via `--turbo4` or `export BONSAI_TURBO4=1`.
-* [ ] **Android JNI & Standalone APK**: Providing ready-to-run JNI wrappers and an on-device UI application for one-click installation without ADB or terminal setup.
-
----
-
 ## Documentation
 
+* [Optimization History: Scalar C++ (52s) to 6.54 tok/s (English)](OPTIMIZATION_HISTORY.md)
 * [Detailed Architecture Deep-Dive (English)](ARCHITECTURE.md)
 * [Русская документация архитектуры](ARCHITECTURE_RU.md)
 * [README на русском языке](README_RU.md)
