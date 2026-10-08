@@ -109,38 +109,107 @@ step 18..19 [MTP 2x MATCH!] tok0=314( of) tok1=9564( Germany) total=407ms (203.5
 
 ---
 
-## Quick Start (Termux / ADB)
+## On-Device Installation & OpenAI Server Guide (Termux / ADB / APK)
 
-### Build Prerequisites
-* Qualcomm Hexagon SDK 5.x / 6.x (or Hexagon LLVM Clang toolchain)
-* Android NDK (r25c or newer, `aarch64-linux-android`)
-* Python 3.10+ (for weight serialization and model repacking)
+This repository provides a complete, ready-to-use runtime shell (`bonsai_fwd` + `libbonsai_q1_skel.so` + built-in OpenAI-compatible HTTP/SSE server and interactive REPL). Whether you prefer running it inside **Termux**, connecting external local clients (SillyTavern, OpenWebUI, Python agents), or wrapping it inside your own **Android APK**, the setup takes only a few commands.
 
-### Compilation
+> **Note on a Visual Debug APK:**  
+> A lightweight prototype Android APK (Debug & Telemetry UI) may be released in the future to help visually inspect NPU layer timings, token streaming, and hardware state on-screen. However, this is a secondary, low-priority task with no fixed timeline (and no guarantee of when it will be built). For now, the repository gives you the complete ready-made engine and server shell so you can plug it into Termux or your own APK however you see fit.
+
+### 1. Prepare Model Weights & Tokenizer (`bonsai2-27b.npubin` & `tok.bin`)
+
+1. Download the source [Ternary-Bonsai-2-27B GGUF](https://huggingface.co/collections/Q-Bonsai/bonsai-2-models) weights and repack them into the monolithic NPU format (`6.74 GiB`):
+   ```bash
+   # Edit GGUF_PATH / OUT_PATH in repack_bonsai2_npu.py if needed, then run:
+   python repack_bonsai2_npu.py
+   ```
+2. Generate the compact binary BPE tokenizer (`tok.bin`) from the included tokenizer metadata:
+   ```bash
+   python cdsp/gen_tok.py --pack Ternary-Bonsai-2-27B-mlx-2bit --output tok.bin
+   ```
+
+### 2. Prebuilt Binaries vs. Building from Source
+
+Pre-compiled binaries for **Snapdragon 8 Elite (Hexagon v79)** are already included in [`cdsp/`](cdsp/):
+* `cdsp/bonsai_fwd` — ARM64 host engine, interactive CLI, and OpenAI HTTP/SSE server
+* `cdsp/libbonsai_q1_skel.so` — Hexagon v79 HVX 1024-bit DSP kernel skeleton
+* `cdsp/libcdsprpc.so` — FastRPC userspace transport library
+* `cdsp/start_bonsai.sh` — Ready-to-use Termux launcher script
+
+*(Optional)* To recompile from source using Qualcomm Hexagon SDK 6.x and Android NDK r26+:
 ```bash
 # 1. Compile Hexagon DSP skeleton (.so)
 hexagon-clang -mv79 -O3 -fvectorize -mhvx -mhvx-length=128b \
   -shared -fPIC -o cdsp/libbonsai_q1_skel.so cdsp/bonsai_hvx.c cdsp/bonsai_imp.c cdsp/gen/bonsai_skel.c
 
 # 2. Compile ARM64 host engine
-$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android34-clang \
-  -O3 -march=armv8.7-a -pthread -o cdsp/bonsai_fwd cdsp/bonsai_fwd_main.c cdsp/tok.c cdsp/ucat.c cdsp/gen/bonsai_stub.c -ldl
+$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang \
+  -O3 -march=armv8.7-a -fopenmp -static-openmp \
+  cdsp/bonsai_fwd_main.c cdsp/bonsai_ops.c cdsp/ucat.c cdsp/gen/bonsai_stub.c \
+  -o cdsp/bonsai_fwd -Icdsp -Icdsp/gen -Lcdsp -lcdsprpc -lm -ldl
 ```
 
-### Execution on Device
+### 3. Deploy Files to Your Phone (via ADB)
+
+Push the runtime files and model to `/data/local/tmp/bonsai1bit` (works on standard non-rooted devices via ADB, or place them directly in Termux `$HOME`):
 ```bash
-# Push binaries and skeleton to device (works on non-rooted phones via ADB)
-adb push cdsp/bonsai_fwd /data/local/tmp/
-adb push cdsp/libbonsai_q1_skel.so /data/local/tmp/
-
-# Start interactive generation
-adb shell "export ADSP_LIBRARY_PATH=/data/local/tmp; cd /data/local/tmp && ./bonsai_fwd bonsai27b-1bit.npubin tok.bin \"Hello, tell me about yourself\" 32"
+adb shell "mkdir -p /data/local/tmp/bonsai1bit"
+adb push cdsp/bonsai_fwd /data/local/tmp/bonsai1bit/
+adb push cdsp/libbonsai_q1_skel.so /data/local/tmp/bonsai1bit/
+adb push cdsp/libcdsprpc.so /data/local/tmp/bonsai1bit/
+adb push cdsp/start_bonsai.sh /data/local/tmp/bonsai1bit/
+adb push tok.bin /data/local/tmp/bonsai1bit/
+adb push bonsai2-27b.npubin /data/local/tmp/bonsai1bit/
+adb shell "chmod 755 /data/local/tmp/bonsai1bit/bonsai_fwd /data/local/tmp/bonsai1bit/start_bonsai.sh"
 ```
 
-For HTTP server mode:
+### 4. Running the OpenAI-Compatible HTTP/SSE Server (`--server`)
+
+Launch the built-in OpenAI API server on port `8080` with 4-bit KV-cache (`--turbo4`), MTP speculative decoding, and stochastic sampling:
 ```bash
-adb shell "export ADSP_LIBRARY_PATH=/data/local/tmp; cd /data/local/tmp && ./bonsai_fwd bonsai27b-1bit.npubin tok.bin --server 8080"
+adb shell "cd /data/local/tmp/bonsai1bit && \
+  export LD_LIBRARY_PATH=/data/local/tmp/bonsai1bit:/vendor/lib64 && \
+  export ADSP_LIBRARY_PATH='/data/local/tmp/bonsai1bit;/vendor/dsp/cdsp;/vendor/lib/rfsa/adsp' && \
+  ./bonsai_fwd bonsai2-27b.npubin tok.bin --server 8080 4096 --turbo4 --temp 0.6 --top-p 0.9"
 ```
+*(Or from Termux using the included wrapper script: `./start_bonsai.sh server 8080`)*
+
+Once running, the server exposes standard OpenAI endpoints (`POST /v1/chat/completions` with `"stream": true` or `"stream": false`, and `GET /v1/models`):
+
+```bash
+# Test streaming chat completions from Termux, PC (via adb forward tcp:8080 tcp:8080), or any HTTP client:
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "bonsai-2-27b",
+    "stream": true,
+    "messages": [
+      {"role": "user", "content": "Explain quantum tunneling in two sentences."}
+    ]
+  }'
+```
+
+### 5. Interactive Terminal Chat (`--chat`) & Single-Shot Benchmark
+
+* **Interactive Console REPL (`--chat`)** — chat directly in Termux or `adb shell` with zero HTTP overhead:
+  ```bash
+  adb shell "cd /data/local/tmp/bonsai1bit && \
+    export LD_LIBRARY_PATH=/data/local/tmp/bonsai1bit:/vendor/lib64 && \
+    export ADSP_LIBRARY_PATH='/data/local/tmp/bonsai1bit;/vendor/dsp/cdsp;/vendor/lib/rfsa/adsp' && \
+    ./bonsai_fwd bonsai2-27b.npubin tok.bin --chat 4096 --turbo4 --temp 0.6 --top-p 0.9"
+  ```
+* **Single-Prompt CLI Benchmark**:
+  ```bash
+  adb shell "cd /data/local/tmp/bonsai1bit && \
+    export LD_LIBRARY_PATH=/data/local/tmp/bonsai1bit:/vendor/lib64 && \
+    export ADSP_LIBRARY_PATH='/data/local/tmp/bonsai1bit;/vendor/dsp/cdsp;/vendor/lib/rfsa/adsp' && \
+    ./bonsai_fwd bonsai2-27b.npubin tok.bin 'The capital of France is' 20 --turbo4 --temp 0.6 --top-p 0.9"
+  ```
+
+### 6. Integrating into Your Own Environment (Termux vs. Custom APK)
+
+* **In Termux**: Run `bonsai_fwd --server 8080` in a background tmux/screen session (with `termux-wake-lock`) and point any OpenAI-compatible CLI tool, Python `openai` client (`base_url="http://127.0.0.1:8080/v1"`), or local web UI to `127.0.0.1:8080`.
+* **In a Custom Android APK**: Bundle `libbonsai_q1_skel.so` and `bonsai_fwd` inside your APK's `jniLibs/arm64-v8a/`, set `ADSP_LIBRARY_PATH` to `context.applicationInfo.nativeLibraryDir`, and either communicate with the local `--server` socket over `http://127.0.0.1:8080/v1/chat/completions` or invoke the engine directly via JNI.
 
 ---
 
