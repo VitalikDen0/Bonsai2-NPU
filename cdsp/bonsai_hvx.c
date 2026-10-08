@@ -146,7 +146,8 @@ typedef enum {
     TASK_DELTANET = 2,
     TASK_FWHT_BLOCK = 3,
     TASK_LIN_PREP = 4,
-    TASK_FULL_GQA = 5
+    TASK_FULL_GQA = 5,
+    TASK_DELTANET_UNDO = 6
 } TaskType;
 
 typedef struct {
@@ -189,6 +190,8 @@ typedef struct {
     float* conv;
     float* qkv;
     float* sc;
+    float* conv_bak;
+    float* rec_bak;
     int c0, c1;
 } WorkerTask;
 
@@ -301,7 +304,7 @@ static void process_slice_q1(int r0, int r1, int in_dim, int prow,
 //      pos_bp = bp0 + 0              (half_prow_u32 = ng * 4 words for +1)
 //      neg_bp = bp0 + half_prow_u32  (half_prow_u32 = ng * 4 words for -1)
 // ============================================================================
-static __attribute__((noinline)) void process_slice_q2_core(int r0, int r1, int in_dim, int prow,
+static __attribute__((noinline)) void process_slice_q2_core(int r0, int r1, int r_prefetch_end, int in_dim, int prow,
                                   const uint32_t* bits_u32, const unsigned short* scales,
                                   const int8_t* qx8_base, const float* sx4_base,
                                   float* y) {
@@ -313,7 +316,7 @@ static __attribute__((noinline)) void process_slice_q2_core(int r0, int r1, int 
 
     int i = r0;
     for (; i + 3 < r1; i += 4) {
-        if (i + 7 < r1) {
+        if (i + 7 < r_prefetch_end) {
             Q6_l2fetch_AR((void*)(bits_u32 + (unsigned)(i + 4) * (unsigned)prow_u32), (int)l2_bits_cfg);
         }
         const unsigned short* sg0 = scales + (unsigned)(i + 0) * (unsigned)ng;
@@ -452,7 +455,7 @@ static __attribute__((noinline)) void process_slice_q2_core(int r0, int r1, int 
 static void process_slice_q2(int r0, int r1, int in_dim, int prow,
                              const uint32_t* bits_u32, const unsigned short* scales,
                              float* y) {
-    process_slice_q2_core(r0, r1, in_dim, prow, bits_u32, scales, hvx_qx8, hvx_sx4, y);
+    process_slice_q2_core(r0, r1, r1, in_dim, prow, bits_u32, scales, hvx_qx8, hvx_sx4, y);
 }
 
 // ============================================================================
@@ -581,7 +584,7 @@ static void process_slice_batch_q1(int r0, int r1, int batch, int out_dim, int i
 //    Shares 100% of DRAM weight loads, bit-plane shifts/masks, and FP16 scale
 //    unpacking across pairs of tokens (b0, b0+1) using 26 of 32 HVX registers.
 // ============================================================================
-static __attribute__((noinline)) void process_slice_q2_pair(int r0, int r1, int in_dim, int prow,
+static __attribute__((noinline)) void process_slice_q2_pair(int r0, int r1, int r_prefetch_end, int in_dim, int prow,
                                   const uint32_t* bits_u32, const unsigned short* scales,
                                   const signed char* qx8_0, const float* sx4_0, float* y_0,
                                   const signed char* qx8_1, const float* sx4_1, float* y_1) {
@@ -594,7 +597,7 @@ static __attribute__((noinline)) void process_slice_q2_pair(int r0, int r1, int 
 
     int i = r0;
     for (; i + 3 < r1; i += 4) {
-        if (i + 7 < r1) {
+        if (i + 7 < r_prefetch_end) {
             Q6_l2fetch_AR((void*)(bits_u32 + (unsigned)(i + 4) * (unsigned)prow_u32), (int)l2_bits_cfg);
         }
         const unsigned short* sg0 = scales + (unsigned)(i + 0) * (unsigned)ng;
@@ -744,8 +747,8 @@ static __attribute__((noinline)) void process_slice_q2_pair(int r0, int r1, int 
         }
     }
     if (i < r1) {
-        process_slice_q2_core(i, r1, in_dim, prow, bits_u32, scales, qx8_0, sx4_0, y_0);
-        process_slice_q2_core(i, r1, in_dim, prow, bits_u32, scales, qx8_1, sx4_1, y_1);
+        process_slice_q2_core(i, r1, r_prefetch_end, in_dim, prow, bits_u32, scales, qx8_0, sx4_0, y_0);
+        process_slice_q2_core(i, r1, 0,              in_dim, prow, bits_u32, scales, qx8_1, sx4_1, y_1);
     }
 }
 
@@ -753,11 +756,24 @@ static void process_slice_batch_q2(int r0, int r1, int batch, int out_dim, int i
                                    const uint32_t* bits_u32, const unsigned short* scales,
                                    float* y) {
     int ng = in_dim >> 7;
-    for (int r_base = r0; r_base < r1; r_base += 16) {
-        int r_end = (r_base + 16 < r1) ? (r_base + 16) : r1;
+    if (batch == 2) {
+        process_slice_q2_pair(r0, r1, r1, in_dim, prow, bits_u32, scales,
+                              hvx_qx8 + 0 * (unsigned)in_dim,
+                              hvx_sx4 + 0 * (unsigned)(ng << 2),
+                              y + 0 * (unsigned)out_dim,
+                              hvx_qx8 + 1 * (unsigned)in_dim,
+                              hvx_sx4 + 1 * (unsigned)(ng << 2),
+                              y + 1 * (unsigned)out_dim);
+        return;
+    }
+    // For batch = 3..4: 8-row tile (10..34 KB per thread = 60..204 KB across 6 threads)
+    // stays 100% resident in L1/L2 cache! b0=0 drives continuous hardware L2 prefetching
+    // across r0..r1 (r_prefetch_end = r1), while b0=2 reads hot L1/L2 cache (r_prefetch_end = 0).
+    for (int r_base = r0; r_base < r1; r_base += 8) {
+        int r_end = (r_base + 8 < r1) ? (r_base + 8) : r1;
         int b0 = 0;
         for (; b0 + 1 < batch; b0 += 2) {
-            process_slice_q2_pair(r_base, r_end, in_dim, prow, bits_u32, scales,
+            process_slice_q2_pair(r_base, r_end, (b0 == 0) ? r1 : 0, in_dim, prow, bits_u32, scales,
                                   hvx_qx8 + (unsigned)(b0 + 0) * (unsigned)in_dim,
                                   hvx_sx4 + (unsigned)(b0 + 0) * (unsigned)(ng << 2),
                                   y + (unsigned)(b0 + 0) * (unsigned)out_dim,
@@ -766,7 +782,7 @@ static void process_slice_batch_q2(int r0, int r1, int batch, int out_dim, int i
                                   y + (unsigned)(b0 + 1) * (unsigned)out_dim);
         }
         for (; b0 < batch; b0++) {
-            process_slice_q2_core(r_base, r_end, in_dim, prow, bits_u32, scales,
+            process_slice_q2_core(r_base, r_end, (b0 == 0) ? r1 : 0, in_dim, prow, bits_u32, scales,
                                   hvx_qx8 + (unsigned)b0 * (unsigned)in_dim,
                                   hvx_sx4 + (unsigned)b0 * (unsigned)(ng << 2),
                                   y + (unsigned)b0 * (unsigned)out_dim);
@@ -932,13 +948,14 @@ static inline float log1pf_dsp(float x) {
 }
 
 static void run_lin_prep_worker(const WorkerTask* t) {
+    int batch          = (t->batch > 1) ? t->batch : 1;
+    int layer_idx      = t->r0;
     const float* x     = t->x_in;
     const uint32_t* wa = t->wa;
     const uint32_t* wb = t->wb;
-    float* avec = t->avec_out;
-    float* bvec = t->bvec_out;
-    const HVX_UVector* vx = (const HVX_UVector*)x;
-    int mask_hi16_r = (int)0xFFFF0000u;
+    float* avec        = t->avec_out;
+    float* bvec        = t->bvec_out;
+    int mask_hi16_r    = (int)0xFFFF0000u;
     asm volatile("" : "+r"(mask_hi16_r));
     HVX_Vector vMaskHi16 = Q6_V_vsplat_R(mask_hi16_r);
 
@@ -949,71 +966,115 @@ static void run_lin_prep_worker(const WorkerTask* t) {
             Q6_l2fetch_AR((void*)(wa + (size_t)(r + 1) * 2560), (int)0x00808050u);
             Q6_l2fetch_AR((void*)(wb + (size_t)(r + 1) * 2560), (int)0x00808050u);
         }
-        HVX_Vector accA0 = Q6_V_vzero(), accA1 = Q6_V_vzero();
-        HVX_Vector accB0 = Q6_V_vzero(), accB1 = Q6_V_vzero();
-        for (int g = 0; g < 160; g += 4) {
-            HVX_Vector x0 = vx[g+0], x1 = vx[g+1], x2 = vx[g+2], x3 = vx[g+3];
-            HVX_Vector pA01 = vwa[(g >> 1) + 0];
-            HVX_Vector pA23 = vwa[(g >> 1) + 1];
-            HVX_Vector wa0 = Q6_Vw_vasl_VwR(pA01, 16);
-            HVX_Vector wa1 = Q6_V_vand_VV(pA01, vMaskHi16);
-            HVX_Vector wa2 = Q6_Vw_vasl_VwR(pA23, 16);
-            HVX_Vector wa3 = Q6_V_vand_VV(pA23, vMaskHi16);
-            HVX_Vector pa01 = Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(wa0, x0), Q6_Vqf32_vmpy_VsfVsf(wa1, x1));
-            HVX_Vector pa23 = Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(wa2, x2), Q6_Vqf32_vmpy_VsfVsf(wa3, x3));
-            accA0 = Q6_Vsf_vadd_VsfVsf(accA0, Q6_Vsf_equals_Vqf32(pa01));
-            accA1 = Q6_Vsf_vadd_VsfVsf(accA1, Q6_Vsf_equals_Vqf32(pa23));
+        if (batch == 1) {
+            const HVX_UVector* vx = (const HVX_UVector*)x;
+            HVX_Vector accA0 = Q6_V_vzero(), accA1 = Q6_V_vzero();
+            HVX_Vector accB0 = Q6_V_vzero(), accB1 = Q6_V_vzero();
+            for (int g = 0; g < 160; g += 4) {
+                HVX_Vector x0 = vx[g+0], x1 = vx[g+1], x2 = vx[g+2], x3 = vx[g+3];
+                HVX_Vector pA01 = vwa[(g >> 1) + 0];
+                HVX_Vector pA23 = vwa[(g >> 1) + 1];
+                HVX_Vector wa0 = Q6_Vw_vasl_VwR(pA01, 16);
+                HVX_Vector wa1 = Q6_V_vand_VV(pA01, vMaskHi16);
+                HVX_Vector wa2 = Q6_Vw_vasl_VwR(pA23, 16);
+                HVX_Vector wa3 = Q6_V_vand_VV(pA23, vMaskHi16);
+                HVX_Vector pa01 = Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(wa0, x0), Q6_Vqf32_vmpy_VsfVsf(wa1, x1));
+                HVX_Vector pa23 = Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(wa2, x2), Q6_Vqf32_vmpy_VsfVsf(wa3, x3));
+                accA0 = Q6_Vsf_vadd_VsfVsf(accA0, Q6_Vsf_equals_Vqf32(pa01));
+                accA1 = Q6_Vsf_vadd_VsfVsf(accA1, Q6_Vsf_equals_Vqf32(pa23));
 
-            HVX_Vector pB01 = vwb[(g >> 1) + 0];
-            HVX_Vector pB23 = vwb[(g >> 1) + 1];
-            HVX_Vector wb0 = Q6_Vw_vasl_VwR(pB01, 16);
-            HVX_Vector wb1 = Q6_V_vand_VV(pB01, vMaskHi16);
-            HVX_Vector wb2 = Q6_Vw_vasl_VwR(pB23, 16);
-            HVX_Vector wb3 = Q6_V_vand_VV(pB23, vMaskHi16);
-            HVX_Vector pb01 = Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(wb0, x0), Q6_Vqf32_vmpy_VsfVsf(wb1, x1));
-            HVX_Vector pb23 = Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(wb2, x2), Q6_Vqf32_vmpy_VsfVsf(wb3, x3));
-            accB0 = Q6_Vsf_vadd_VsfVsf(accB0, Q6_Vsf_equals_Vqf32(pb01));
-            accB1 = Q6_Vsf_vadd_VsfVsf(accB1, Q6_Vsf_equals_Vqf32(pb23));
+                HVX_Vector pB01 = vwb[(g >> 1) + 0];
+                HVX_Vector pB23 = vwb[(g >> 1) + 1];
+                HVX_Vector wb0 = Q6_Vw_vasl_VwR(pB01, 16);
+                HVX_Vector wb1 = Q6_V_vand_VV(pB01, vMaskHi16);
+                HVX_Vector wb2 = Q6_Vw_vasl_VwR(pB23, 16);
+                HVX_Vector wb3 = Q6_V_vand_VV(pB23, vMaskHi16);
+                HVX_Vector pb01 = Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(wb0, x0), Q6_Vqf32_vmpy_VsfVsf(wb1, x1));
+                HVX_Vector pb23 = Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(wb2, x2), Q6_Vqf32_vmpy_VsfVsf(wb3, x3));
+                accB0 = Q6_Vsf_vadd_VsfVsf(accB0, Q6_Vsf_equals_Vqf32(pb01));
+                accB1 = Q6_Vsf_vadd_VsfVsf(accB1, Q6_Vsf_equals_Vqf32(pb23));
+            }
+            avec[r] = hvx_reduce_sum32(Q6_Vsf_vadd_VsfVsf(accA0, accA1));
+            bvec[r] = hvx_reduce_sum32(Q6_Vsf_vadd_VsfVsf(accB0, accB1));
+        } else {
+            HVX_Vector accA[4], accB[4];
+            for (int b = 0; b < batch; b++) { accA[b] = Q6_V_vzero(); accB[b] = Q6_V_vzero(); }
+            for (int g = 0; g < 160; g += 4) {
+                HVX_Vector pA01 = vwa[(g >> 1) + 0];
+                HVX_Vector pA23 = vwa[(g >> 1) + 1];
+                HVX_Vector wa0 = Q6_Vw_vasl_VwR(pA01, 16);
+                HVX_Vector wa1 = Q6_V_vand_VV(pA01, vMaskHi16);
+                HVX_Vector wa2 = Q6_Vw_vasl_VwR(pA23, 16);
+                HVX_Vector wa3 = Q6_V_vand_VV(pA23, vMaskHi16);
+
+                HVX_Vector pB01 = vwb[(g >> 1) + 0];
+                HVX_Vector pB23 = vwb[(g >> 1) + 1];
+                HVX_Vector wb0 = Q6_Vw_vasl_VwR(pB01, 16);
+                HVX_Vector wb1 = Q6_V_vand_VV(pB01, vMaskHi16);
+                HVX_Vector wb2 = Q6_Vw_vasl_VwR(pB23, 16);
+                HVX_Vector wb3 = Q6_V_vand_VV(pB23, vMaskHi16);
+
+                for (int b = 0; b < batch; b++) {
+                    const HVX_UVector* vx = (const HVX_UVector*)(x + (size_t)b * 5120);
+                    HVX_Vector x0 = vx[g+0], x1 = vx[g+1], x2 = vx[g+2], x3 = vx[g+3];
+                    HVX_Vector pa01 = Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(wa0, x0), Q6_Vqf32_vmpy_VsfVsf(wa1, x1));
+                    HVX_Vector pa23 = Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(wa2, x2), Q6_Vqf32_vmpy_VsfVsf(wa3, x3));
+                    accA[b] = Q6_Vsf_vadd_VsfVsf(accA[b], Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vqf32(pa01, pa23)));
+
+                    HVX_Vector pb01 = Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(wb0, x0), Q6_Vqf32_vmpy_VsfVsf(wb1, x1));
+                    HVX_Vector pb23 = Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(wb2, x2), Q6_Vqf32_vmpy_VsfVsf(wb3, x3));
+                    accB[b] = Q6_Vsf_vadd_VsfVsf(accB[b], Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vqf32(pb01, pb23)));
+                }
+            }
+            for (int b = 0; b < batch; b++) {
+                avec[b * 48 + r] = hvx_reduce_sum32(accA[b]);
+                bvec[b * 48 + r] = hvx_reduce_sum32(accB[b]);
+            }
         }
-        avec[r] = hvx_reduce_sum32(Q6_Vsf_vadd_VsfVsf(accA0, accA1));
-        bvec[r] = hvx_reduce_sum32(Q6_Vsf_vadd_VsfVsf(accB0, accB1));
     }
 
     const float* cw = t->cw;
     float* conv = t->conv;
-    float* qkv  = t->qkv;
     float acc_buf[32] __attribute__((aligned(128)));
-    int c = t->c0;
-    for (; c + 31 < t->c1; c += 32) {
-        for (int k = 0; k < 32; k++) {
-            int ch = c + k;
-            float xm3 = conv[ch * 3 + 0];
-            float xm2 = conv[ch * 3 + 1];
-            float xm1 = conv[ch * 3 + 2];
-            float x0  = qkv[ch];
-            conv[ch * 3 + 0] = xm2;
-            conv[ch * 3 + 1] = xm1;
-            conv[ch * 3 + 2] = x0;
-            const float* cwc = cw + (size_t)ch * 4;
-            acc_buf[k] = xm3 * cwc[0] + xm2 * cwc[1] + xm1 * cwc[2] + x0 * cwc[3];
+    for (int b = 0; b < batch; b++) {
+        float* qkv = t->qkv + (size_t)b * 16384;
+        float* conv_bak = (b >= 1 && t->conv_bak) ? (t->conv_bak + ((size_t)(b - 1) * 48 + layer_idx) * 10240) : NULL;
+        int c = t->c0;
+        for (; c + 31 < t->c1; c += 32) {
+            for (int k = 0; k < 32; k++) {
+                int ch = c + k;
+                float xm3 = conv[ch * 3 + 0];
+                float xm2 = conv[ch * 3 + 1];
+                float xm1 = conv[ch * 3 + 2];
+                float x0  = qkv[ch];
+                if (conv_bak) conv_bak[ch] = xm3;
+                conv[ch * 3 + 0] = xm2;
+                conv[ch * 3 + 1] = xm1;
+                conv[ch * 3 + 2] = x0;
+                const float* cwc = cw + (size_t)ch * 4;
+                acc_buf[k] = xm3 * cwc[0] + xm2 * cwc[1] + xm1 * cwc[2] + x0 * cwc[3];
+            }
+            *(HVX_UVector*)(qkv + c) = hvx_silu_vec(*(const HVX_Vector*)acc_buf);
         }
-        *(HVX_UVector*)(qkv + c) = hvx_silu_vec(*(const HVX_Vector*)acc_buf);
-    }
-    for (; c < t->c1; c++) {
-        float xm3 = conv[c * 3 + 0];
-        float xm2 = conv[c * 3 + 1];
-        float xm1 = conv[c * 3 + 2];
-        float x0  = qkv[c];
-        conv[c * 3 + 0] = xm2;
-        conv[c * 3 + 1] = xm1;
-        conv[c * 3 + 2] = x0;
-        const float* cwc = cw + (size_t)c * 4;
-        float acc = xm3 * cwc[0] + xm2 * cwc[1] + xm1 * cwc[2] + x0 * cwc[3];
-        qkv[c] = silu_f_dsp(acc);
+        for (; c < t->c1; c++) {
+            float xm3 = conv[c * 3 + 0];
+            float xm2 = conv[c * 3 + 1];
+            float xm1 = conv[c * 3 + 2];
+            float x0  = qkv[c];
+            if (conv_bak) conv_bak[c] = xm3;
+            conv[c * 3 + 0] = xm2;
+            conv[c * 3 + 1] = xm1;
+            conv[c * 3 + 2] = x0;
+            const float* cwc = cw + (size_t)c * 4;
+            float acc = xm3 * cwc[0] + xm2 * cwc[1] + xm1 * cwc[2] + x0 * cwc[3];
+            qkv[c] = silu_f_dsp(acc);
+        }
     }
 }
 
 static void run_deltanet_worker(const WorkerTask* t) {
+    int batch = (t->batch > 1) ? t->batch : 1;
+    int layer_idx = t->r0;
     int h0 = t->h0;
     int h1 = t->h1;
     const float* alog = t->alog;
@@ -1029,31 +1090,123 @@ static void run_deltanet_worker(const WorkerTask* t) {
     float* no = t->no;
     const HVX_UVector* vnw = (const HVX_UVector*)nw;
 
+    if (batch == 1) {
+        for (int h = h0; h < h1; h++) {
+            float oh[128] __attribute__((aligned(128)));
+            float* Sh = S + (size_t)h * 128 * 128;
+            float al = -fast_expf_dsp(alog[h]);
+            float db = dtb[h];
+            float beta = sigf_dsp(bvec[h]);
+            float gv = al * log1pf_dsp(fast_expf_dsp(avec[h] + db));
+            float eg = fast_expf_dsp(gv);
+            const float* qh = q + (size_t)(h / 3) * 128;
+            const float* kh = k + (size_t)(h / 3) * 128;
+            const float* vh = v + (size_t)h * 128;
+
+            int32_t eg_bits;
+            memcpy(&eg_bits, &eg, 4);
+            HVX_Vector vEg = Q6_V_vsplat_R(eg_bits);
+
+            const HVX_UVector* vQh = (const HVX_UVector*)qh;
+            const HVX_UVector* vKh = (const HVX_UVector*)kh;
+            HVX_Vector vQ0 = vQh[0], vQ1 = vQh[1], vQ2 = vQh[2], vQ3 = vQh[3];
+            HVX_Vector vK0 = vKh[0], vK1 = vKh[1], vK2 = vKh[2], vK3 = vKh[3];
+
+            HVX_Vector vKQ01 = Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(vK0, vQ0), Q6_Vqf32_vmpy_VsfVsf(vK1, vQ1));
+            HVX_Vector vKQ23 = Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(vK2, vQ2), Q6_Vqf32_vmpy_VsfVsf(vK3, vQ3));
+            float kq = hvx_reduce_sum32(Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vqf32(vKQ01, vKQ23)));
+            double norm_sq = 0.0;
+
+            Q6_l2fetch_AR((void*)Sh, (int)0x00808010u);
+            for (int j = 0; j < 128; j++) {
+                if (j + 4 < 128) {
+                    Q6_l2fetch_AR((void*)(Sh + (size_t)(j + 4) * 128), (int)0x00808004u);
+                }
+                HVX_UVector* vSj = (HVX_UVector*)(Sh + (size_t)j * 128);
+                HVX_Vector vS0 = vSj[0], vS1 = vSj[1], vS2 = vSj[2], vS3 = vSj[3];
+
+                HVX_Vector vSK01 = Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(vS0, vK0), Q6_Vqf32_vmpy_VsfVsf(vS1, vK1));
+                HVX_Vector vSK23 = Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(vS2, vK2), Q6_Vqf32_vmpy_VsfVsf(vS3, vK3));
+                float sk = hvx_reduce_sum32(Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vqf32(vSK01, vSK23)));
+
+                HVX_Vector vSQ01 = Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(vS0, vQ0), Q6_Vqf32_vmpy_VsfVsf(vS1, vQ1));
+                HVX_Vector vSQ23 = Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(vS2, vQ2), Q6_Vqf32_vmpy_VsfVsf(vS3, vQ3));
+                float sq = hvx_reduce_sum32(Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vqf32(vSQ01, vSQ23)));
+
+                float kv = sk * eg;
+                float delta = (vh[j] - kv) * beta;
+                float oj = sq * eg + delta * kq;
+                oh[j] = oj;
+                norm_sq += (double)oj * oj;
+
+                int32_t d_bits;
+                memcpy(&d_bits, &delta, 4);
+                HVX_Vector vDelta = Q6_V_vsplat_R(d_bits);
+
+                vSj[0] = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(vS0, vEg), Q6_Vqf32_vmpy_VsfVsf(vK0, vDelta)));
+                vSj[1] = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(vS1, vEg), Q6_Vqf32_vmpy_VsfVsf(vK1, vDelta)));
+                vSj[2] = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(vS2, vEg), Q6_Vqf32_vmpy_VsfVsf(vK2, vDelta)));
+                vSj[3] = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(vS3, vEg), Q6_Vqf32_vmpy_VsfVsf(vK3, vDelta)));
+            }
+            const HVX_UVector* vzr = (const HVX_UVector*)(z + (size_t)h * 128);
+            const HVX_Vector* voh  = (const HVX_Vector*)oh;
+            HVX_UVector* vnoh      = (HVX_UVector*)(no + (size_t)h * 128);
+            float inv = 1.0f / sqrtf((float)(norm_sq / 128.0) + 1e-6f);
+            int32_t inv_bits;
+            memcpy(&inv_bits, &inv, 4);
+            HVX_Vector vInv = Q6_V_vsplat_R(inv_bits);
+            for (int c = 0; c < 4; c++) {
+                HVX_Vector vNormed = Q6_Vsf_vmpy_VsfVsf(Q6_Vsf_vmpy_VsfVsf(voh[c], vInv), vnw[c]);
+                vnoh[c] = Q6_Vsf_vmpy_VsfVsf(vNormed, hvx_silu_vec(vzr[c]));
+            }
+        }
+        dsp_fwht1024_block(no + (size_t)h0 * 128, t->fwht_signs);
+        return;
+    }
+
+    // Fused Multi-Token Recurrence (batch = 2..4):
+    // Loads Sh [128x128] from DRAM ONCE, updates all batch steps in HVX registers, and writes Sh ONCE!
     for (int h = h0; h < h1; h++) {
-        float oh[128] __attribute__((aligned(128)));
+        float oh[4][128] __attribute__((aligned(128)));
         float* Sh = S + (size_t)h * 128 * 128;
         float al = -fast_expf_dsp(alog[h]);
         float db = dtb[h];
-        float beta = sigf_dsp(bvec[h]);
-        float gv = al * log1pf_dsp(fast_expf_dsp(avec[h] + db));
-        float eg = fast_expf_dsp(gv);
-        const float* qh = q + (size_t)(h / 3) * 128;
-        const float* kh = k + (size_t)(h / 3) * 128;
-        const float* vh = v + (size_t)h * 128;
 
-        int32_t eg_bits;
-        memcpy(&eg_bits, &eg, 4);
-        HVX_Vector vEg = Q6_V_vsplat_R(eg_bits);
+        float eg_b[4], beta_b[4], kq_b[4];
+        double norm_sq_b[4] = {0.0, 0.0, 0.0, 0.0};
+        HVX_Vector vEg_b[4];
+        HVX_Vector vQ_b[4][4], vK_b[4][4];
+        float* delta_bak_b[4] = {NULL, NULL, NULL, NULL};
 
-        const HVX_UVector* vQh = (const HVX_UVector*)qh;
-        const HVX_UVector* vKh = (const HVX_UVector*)kh;
-        HVX_Vector vQ0 = vQh[0], vQ1 = vQh[1], vQ2 = vQh[2], vQ3 = vQh[3];
-        HVX_Vector vK0 = vKh[0], vK1 = vKh[1], vK2 = vKh[2], vK3 = vKh[3];
+        for (int b = 0; b < batch; b++) {
+            beta_b[b] = sigf_dsp(bvec[b * 48 + h]);
+            float gv  = al * log1pf_dsp(fast_expf_dsp(avec[b * 48 + h] + db));
+            float eg  = fast_expf_dsp(gv);
+            eg_b[b]   = eg;
+            int32_t eg_bits;
+            memcpy(&eg_bits, &eg, 4);
+            vEg_b[b]  = Q6_V_vsplat_R(eg_bits);
 
-        HVX_Vector vKQ01 = Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(vK0, vQ0), Q6_Vqf32_vmpy_VsfVsf(vK1, vQ1));
-        HVX_Vector vKQ23 = Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(vK2, vQ2), Q6_Vqf32_vmpy_VsfVsf(vK3, vQ3));
-        float kq = hvx_reduce_sum32(Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vqf32(vKQ01, vKQ23)));
-        double norm_sq = 0.0;
+            const float* qkv_b = q + (size_t)b * 16384;
+            const HVX_UVector* vQh = (const HVX_UVector*)(qkv_b + (size_t)(h / 3) * 128);
+            const HVX_UVector* vKh = (const HVX_UVector*)(qkv_b + 2048 + (size_t)(h / 3) * 128);
+            vQ_b[b][0] = vQh[0]; vQ_b[b][1] = vQh[1]; vQ_b[b][2] = vQh[2]; vQ_b[b][3] = vQh[3];
+            vK_b[b][0] = vKh[0]; vK_b[b][1] = vKh[1]; vK_b[b][2] = vKh[2]; vK_b[b][3] = vKh[3];
+
+            HVX_Vector vKQ01 = Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(vK_b[b][0], vQ_b[b][0]), Q6_Vqf32_vmpy_VsfVsf(vK_b[b][1], vQ_b[b][1]));
+            HVX_Vector vKQ23 = Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(vK_b[b][2], vQ_b[b][2]), Q6_Vqf32_vmpy_VsfVsf(vK_b[b][3], vQ_b[b][3]));
+            kq_b[b] = hvx_reduce_sum32(Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vqf32(vKQ01, vKQ23)));
+
+            if (b >= 1 && t->rec_bak) {
+                float* rbak = t->rec_bak + ((size_t)(b - 1) * 48 + layer_idx) * 8256;
+                rbak[h] = 1.0f / eg;
+                if ((h % 3) == 0) {
+                    HVX_UVector* vKb = (HVX_UVector*)(rbak + 64 + (size_t)(h / 3) * 128);
+                    vKb[0] = vK_b[b][0]; vKb[1] = vK_b[b][1]; vKb[2] = vK_b[b][2]; vKb[3] = vK_b[b][3];
+                }
+                delta_bak_b[b] = rbak + 64 + 2048 + (size_t)h * 128;
+            }
+        }
 
         Q6_l2fetch_AR((void*)Sh, (int)0x00808010u);
         for (int j = 0; j < 128; j++) {
@@ -1063,43 +1216,98 @@ static void run_deltanet_worker(const WorkerTask* t) {
             HVX_UVector* vSj = (HVX_UVector*)(Sh + (size_t)j * 128);
             HVX_Vector vS0 = vSj[0], vS1 = vSj[1], vS2 = vSj[2], vS3 = vSj[3];
 
-            HVX_Vector vSK01 = Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(vS0, vK0), Q6_Vqf32_vmpy_VsfVsf(vS1, vK1));
-            HVX_Vector vSK23 = Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(vS2, vK2), Q6_Vqf32_vmpy_VsfVsf(vS3, vK3));
-            float sk = hvx_reduce_sum32(Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vqf32(vSK01, vSK23)));
+            for (int b = 0; b < batch; b++) {
+                HVX_Vector vK0 = vK_b[b][0], vK1 = vK_b[b][1], vK2 = vK_b[b][2], vK3 = vK_b[b][3];
+                HVX_Vector vQ0 = vQ_b[b][0], vQ1 = vQ_b[b][1], vQ2 = vQ_b[b][2], vQ3 = vQ_b[b][3];
 
-            HVX_Vector vSQ01 = Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(vS0, vQ0), Q6_Vqf32_vmpy_VsfVsf(vS1, vQ1));
-            HVX_Vector vSQ23 = Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(vS2, vQ2), Q6_Vqf32_vmpy_VsfVsf(vS3, vQ3));
-            float sq = hvx_reduce_sum32(Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vqf32(vSQ01, vSQ23)));
+                HVX_Vector vSK01 = Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(vS0, vK0), Q6_Vqf32_vmpy_VsfVsf(vS1, vK1));
+                HVX_Vector vSK23 = Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(vS2, vK2), Q6_Vqf32_vmpy_VsfVsf(vS3, vK3));
+                float sk = hvx_reduce_sum32(Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vqf32(vSK01, vSK23)));
 
-            float kv = sk * eg;
-            float delta = (vh[j] - kv) * beta;
-            float oj = sq * eg + delta * kq;
-            oh[j] = oj;
-            norm_sq += (double)oj * oj;
+                HVX_Vector vSQ01 = Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(vS0, vQ0), Q6_Vqf32_vmpy_VsfVsf(vS1, vQ1));
+                HVX_Vector vSQ23 = Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(vS2, vQ2), Q6_Vqf32_vmpy_VsfVsf(vS3, vQ3));
+                float sq = hvx_reduce_sum32(Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vqf32(vSQ01, vSQ23)));
 
-            int32_t d_bits;
-            memcpy(&d_bits, &delta, 4);
-            HVX_Vector vDelta = Q6_V_vsplat_R(d_bits);
+                const float* vh = (q + (size_t)b * 16384 + 4096) + (size_t)h * 128;
+                float eg = eg_b[b];
+                float kv = sk * eg;
+                float delta = (vh[j] - kv) * beta_b[b];
+                if (delta_bak_b[b]) delta_bak_b[b][j] = delta;
+                float oj = sq * eg + delta * kq_b[b];
+                oh[b][j] = oj;
+                norm_sq_b[b] += (double)oj * oj;
 
-            vSj[0] = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(vS0, vEg), Q6_Vqf32_vmpy_VsfVsf(vK0, vDelta)));
-            vSj[1] = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(vS1, vEg), Q6_Vqf32_vmpy_VsfVsf(vK1, vDelta)));
-            vSj[2] = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(vS2, vEg), Q6_Vqf32_vmpy_VsfVsf(vK2, vDelta)));
-            vSj[3] = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(vS3, vEg), Q6_Vqf32_vmpy_VsfVsf(vK3, vDelta)));
+                int32_t d_bits;
+                memcpy(&d_bits, &delta, 4);
+                HVX_Vector vDelta = Q6_V_vsplat_R(d_bits);
+                HVX_Vector vEg    = vEg_b[b];
+
+                vS0 = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(vS0, vEg), Q6_Vqf32_vmpy_VsfVsf(vK0, vDelta)));
+                vS1 = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(vS1, vEg), Q6_Vqf32_vmpy_VsfVsf(vK1, vDelta)));
+                vS2 = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(vS2, vEg), Q6_Vqf32_vmpy_VsfVsf(vK2, vDelta)));
+                vS3 = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(vS3, vEg), Q6_Vqf32_vmpy_VsfVsf(vK3, vDelta)));
+            }
+            vSj[0] = vS0; vSj[1] = vS1; vSj[2] = vS2; vSj[3] = vS3;
         }
-        const HVX_UVector* vzr = (const HVX_UVector*)(z + (size_t)h * 128);
-        const HVX_Vector* voh  = (const HVX_Vector*)oh;
-        HVX_UVector* vnoh      = (HVX_UVector*)(no + (size_t)h * 128);
-        float inv = 1.0f / sqrtf((float)(norm_sq / 128.0) + 1e-6f);
-        int32_t inv_bits;
-        memcpy(&inv_bits, &inv, 4);
-        HVX_Vector vInv = Q6_V_vsplat_R(inv_bits);
-        for (int c = 0; c < 4; c++) {
-            HVX_Vector vNormed = Q6_Vsf_vmpy_VsfVsf(Q6_Vsf_vmpy_VsfVsf(voh[c], vInv), vnw[c]);
-            vnoh[c] = Q6_Vsf_vmpy_VsfVsf(vNormed, hvx_silu_vec(vzr[c]));
+
+        for (int b = 0; b < batch; b++) {
+            const HVX_UVector* vzr = (const HVX_UVector*)(q + (size_t)b * 16384 + 10240 + (size_t)h * 128);
+            const HVX_Vector* voh  = (const HVX_Vector*)oh[b];
+            HVX_UVector* vnoh      = (HVX_UVector*)(no + (size_t)b * 6144 + (size_t)h * 128);
+            float inv = 1.0f / sqrtf((float)(norm_sq_b[b] / 128.0) + 1e-6f);
+            int32_t inv_bits;
+            memcpy(&inv_bits, &inv, 4);
+            HVX_Vector vInv = Q6_V_vsplat_R(inv_bits);
+            for (int c = 0; c < 4; c++) {
+                HVX_Vector vNormed = Q6_Vsf_vmpy_VsfVsf(Q6_Vsf_vmpy_VsfVsf(voh[c], vInv), vnw[c]);
+                vnoh[c] = Q6_Vsf_vmpy_VsfVsf(vNormed, hvx_silu_vec(vzr[c]));
+            }
         }
     }
-    // Fused FWHT-1024 on this worker's 8 heads (8 * 128 = 1024 floats) while hot in L1!
-    dsp_fwht1024_block(no + (size_t)h0 * 128, t->fwht_signs);
+    for (int b = 0; b < batch; b++) {
+        dsp_fwht1024_block(no + (size_t)b * 6144 + (size_t)h0 * 128, t->fwht_signs);
+    }
+}
+
+static void run_deltanet_undo_worker(const WorkerTask* t) {
+    if (t->conv && t->conv_bak) {
+        for (int ch = t->c0; ch < t->c1; ch++) {
+            float xm3 = t->conv_bak[ch];
+            float xm2 = t->conv[ch * 3 + 0];
+            float xm1 = t->conv[ch * 3 + 1];
+            t->conv[ch * 3 + 0] = xm3;
+            t->conv[ch * 3 + 1] = xm2;
+            t->conv[ch * 3 + 2] = xm1;
+        }
+    }
+    if (!t->S || !t->rec_bak) return;
+    for (int h = t->h0; h < t->h1; h++) {
+        float* Sh = t->S + (size_t)h * 128 * 128;
+        float inv_eg = t->rec_bak[h];
+        int32_t ieg_bits;
+        memcpy(&ieg_bits, &inv_eg, 4);
+        HVX_Vector vInvEg = Q6_V_vsplat_R(ieg_bits);
+        const HVX_UVector* vKh = (const HVX_UVector*)(t->rec_bak + 64 + (size_t)(h / 3) * 128);
+        HVX_Vector vK0 = vKh[0], vK1 = vKh[1], vK2 = vKh[2], vK3 = vKh[3];
+        const float* delta_h = t->rec_bak + 64 + 2048 + (size_t)h * 128;
+
+        Q6_l2fetch_AR((void*)Sh, (int)0x00808010u);
+        for (int j = 0; j < 128; j++) {
+            if (j + 4 < 128) {
+                Q6_l2fetch_AR((void*)(Sh + (size_t)(j + 4) * 128), (int)0x00808004u);
+            }
+            HVX_UVector* vSj = (HVX_UVector*)(Sh + (size_t)j * 128);
+            float dj = delta_h[j];
+            int32_t d_bits;
+            memcpy(&d_bits, &dj, 4);
+            HVX_Vector vDelta = Q6_V_vsplat_R(d_bits);
+
+            vSj[0] = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(Q6_Vsf_equals_Vqf32(Q6_Vqf32_vsub_VsfVsf(vSj[0], Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(vK0, vDelta)))), vInvEg));
+            vSj[1] = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(Q6_Vsf_equals_Vqf32(Q6_Vqf32_vsub_VsfVsf(vSj[1], Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(vK1, vDelta)))), vInvEg));
+            vSj[2] = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(Q6_Vsf_equals_Vqf32(Q6_Vqf32_vsub_VsfVsf(vSj[2], Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(vK2, vDelta)))), vInvEg));
+            vSj[3] = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(Q6_Vsf_equals_Vqf32(Q6_Vqf32_vsub_VsfVsf(vSj[3], Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(vK3, vDelta)))), vInvEg));
+        }
+    }
 }
 
 static inline HVX_Vector hvx_mul_sigmoid_vec(HVX_Vector vO, HVX_Vector vX) {
@@ -1394,6 +1602,8 @@ static void worker_entry(void* arg) {
             }
         } else if (t->task_type == TASK_DELTANET) {
             run_deltanet_worker(t);
+        } else if (t->task_type == TASK_DELTANET_UNDO) {
+            run_deltanet_undo_worker(t);
         } else if (t->task_type == TASK_LIN_PREP) {
             run_lin_prep_worker(t);
         } else if (t->task_type == TASK_FULL_GQA) {
@@ -1551,9 +1761,9 @@ int hvx_swiglu_fwht1024(int batch, const float* gate_up, const float* signs, flo
 //   DeltaNet Recurrence S_h (48 heads x 128x128) + Fused FWHT-6144 across 6 QuRT threads ->
 //   out_proj GEMV (5120x6144)
 // ============================================================================
-static float g_dsp_lin_x_fwht[5120] __attribute__((aligned(128)));
-static float g_dsp_lin_qkv_z[16384] __attribute__((aligned(128)));
-static float g_dsp_lin_no[6144] __attribute__((aligned(128)));
+static float g_dsp_lin_x_fwht[4 * 5120] __attribute__((aligned(128)));
+static float g_dsp_lin_qkv_z[4 * 16384] __attribute__((aligned(128)));
+static float g_dsp_lin_no[4 * 6144] __attribute__((aligned(128)));
 
 int hvx_lmhead_static_q1(int out_dim, int in_dim, int prow,
                          const float* x, const unsigned char* bits,
@@ -1642,6 +1852,8 @@ int hvx_lin_attn_fused(int layer_idx,
         if (c0 > 10240) c0 = 10240;
         if (c1 > 10240) c1 = 10240;
         g_tasks[w].task_type = TASK_LIN_PREP;
+        g_tasks[w].batch = 1;
+        g_tasks[w].r0 = layer_idx;
         g_tasks[w].h0 = w * 8;
         g_tasks[w].h1 = (w + 1) * 8;
         g_tasks[w].x_in = x;
@@ -1651,6 +1863,7 @@ int hvx_lin_attn_fused(int layer_idx,
         g_tasks[w].bvec_out = bvec;
         g_tasks[w].cw = cw;
         g_tasks[w].conv = conv;
+        g_tasks[w].conv_bak = NULL;
         g_tasks[w].qkv = qkv;
         g_tasks[w].c0 = c0;
         g_tasks[w].c1 = c1;
@@ -1700,6 +1913,8 @@ int hvx_lin_attn_fused(int layer_idx,
 
     for (int w = 0; w < NUM_WORKERS; w++) {
         g_tasks[w].task_type = TASK_DELTANET;
+        g_tasks[w].batch = 1;
+        g_tasks[w].r0 = layer_idx;
         g_tasks[w].h0 = w * 8;
         g_tasks[w].h1 = (w + 1) * 8;
         g_tasks[w].alog = alog;
@@ -1713,6 +1928,7 @@ int hvx_lin_attn_fused(int layer_idx,
         g_tasks[w].nw = nw;
         g_tasks[w].S = S_layer;
         g_tasks[w].no = no;
+        g_tasks[w].rec_bak = NULL;
         g_tasks[w].fwht_signs = signs_6144 ? (signs_6144 + w * 1024) : NULL;
         qurt_sem_up(&g_sem_start[w]);
     }
@@ -1724,10 +1940,13 @@ int hvx_lin_attn_fused(int layer_idx,
     return hvx_gemv_q1(5120, 6144, 1536, no, out_bits, out_scales, y);
 }
 
-static float g_dsp_layer_h[5120]    __attribute__((aligned(128)));
-static float g_dsp_layer_xn[5120]   __attribute__((aligned(128)));
-static float g_dsp_layer_yo[5120]   __attribute__((aligned(128)));
-static float g_dsp_lm_logits[124160] __attribute__((aligned(128)));
+extern float* g_dsp_ssm_conv_bak;
+extern float* g_dsp_ssm_rec_bak;
+
+static float g_dsp_layer_h[4 * 5120]    __attribute__((aligned(128)));
+static float g_dsp_layer_xn[4 * 5120]   __attribute__((aligned(128)));
+static float g_dsp_layer_yo[4 * 5120]   __attribute__((aligned(128)));
+static float g_dsp_lm_logits[124160]    __attribute__((aligned(128)));
 
 static void dsp_argmax_n(const float* buf, int n, int r_base, float* out_y) {
     const HVX_UVector* vBuf = (const HVX_UVector*)buf;
@@ -1758,10 +1977,15 @@ static void dsp_argmax_n(const float* buf, int n, int r_base, float* out_y) {
     int32_t global_i = r_base + best_i;
     out_y[0] = best_v;
     memcpy(&out_y[1], &global_i, 4);
+    for (int k = 0; k < 32; k++) {
+        int32_t gi = r_base + idxs[k];
+        out_y[2 + 2 * k + 0] = vals[k];
+        memcpy(&out_y[2 + 2 * k + 1], &gi, 4);
+    }
 }
 
 int hvx_lin_layer_fused(int layer_idx,
-                        const float* x,
+                        const float* x, int xLen,
                         const unsigned char* in_bits, const short* in_scales,
                         const unsigned char* out_bits, const short* out_scales,
                         const unsigned char* gate_bits, const short* gate_scales,
@@ -1772,26 +1996,86 @@ int hvx_lin_layer_fused(int layer_idx,
                         float* mlp_gate_up_buf, float* mlp_fwht_buf,
                         float* y) {
     init_thread_pool();
-
-    if (layer_idx == -100 || layer_idx == -101) {
-        if (layer_idx == -100) {
-            memcpy(g_dsp_lin_x_fwht, x, 5120 * sizeof(float));
-            if (signs_5120) {
-                for (int w = 0; w < 5; w++) {
-                    dsp_fwht1024_block(g_dsp_lin_x_fwht + w * 1024, signs_5120 + w * 1024);
+    if (layer_idx <= -500 && layer_idx >= -599) {
+        int code  = -500 - layer_idx;
+        int B_tot = (code >> 4) & 7;
+        int n_acc = code & 7;
+        if (B_tot <= 1) B_tot = 2;
+        if (n_acc < 1)  n_acc = 1;
+        if (!g_dsp_ssm_conv_bak || !g_dsp_ssm_rec_bak) return -501;
+        int c_chunk = 54 * 32;
+        for (int b = B_tot - 1; b >= n_acc; b--) {
+            int d = b - 1;
+            if (d < 0 || d > 2) continue;
+            for (int L = 0; L < 48; L++) {
+                float* conv     = (float*)ssm_conv + (size_t)L * 10240 * 3;
+                float* S_layer  = (float*)ssm_rec  + (size_t)L * 48 * 128 * 128;
+                float* conv_bak = g_dsp_ssm_conv_bak + ((size_t)d * 48 + L) * 10240;
+                float* rec_bak  = g_dsp_ssm_rec_bak  + ((size_t)d * 48 + L) * 8256;
+                for (int w = 0; w < NUM_WORKERS; w++) {
+                    int c0 = w * c_chunk;
+                    int c1 = (w + 1) * c_chunk;
+                    if (c0 > 10240) c0 = 10240;
+                    if (c1 > 10240) c1 = 10240;
+                    g_tasks[w].task_type = TASK_DELTANET_UNDO;
+                    g_tasks[w].h0 = w * 8;
+                    g_tasks[w].h1 = (w + 1) * 8;
+                    g_tasks[w].c0 = c0;
+                    g_tasks[w].c1 = c1;
+                    g_tasks[w].conv = conv;
+                    g_tasks[w].conv_bak = conv_bak;
+                    g_tasks[w].S = S_layer;
+                    g_tasks[w].rec_bak = rec_bak;
+                    qurt_sem_up(&g_sem_start[w]);
+                }
+                for (int w = 0; w < NUM_WORKERS; w++) {
+                    qurt_sem_down(&g_sem_done[w]);
                 }
             }
         }
-        int r0 = hvx_gemv_q1(31040, 5120, 1280, g_dsp_lin_x_fwht, in_bits,   in_scales,   g_dsp_lm_logits + 0 * 31040);
-        if (r0 != 0) return r0;
-        int r1 = hvx_gemv_q1(31040, 5120, 1280, g_dsp_lin_x_fwht, out_bits,  out_scales,  g_dsp_lm_logits + 1 * 31040);
-        if (r1 != 0) return r1;
-        int r2 = hvx_gemv_q1(31040, 5120, 1280, g_dsp_lin_x_fwht, gate_bits, gate_scales, g_dsp_lm_logits + 2 * 31040);
-        if (r2 != 0) return r2;
-        int r3 = hvx_gemv_q1(31040, 5120, 1280, g_dsp_lin_x_fwht, down_bits, down_scales, g_dsp_lm_logits + 3 * 31040);
-        if (r3 != 0) return r3;
-        dsp_argmax_n(g_dsp_lm_logits, 124160, (layer_idx == -100) ? 0 : 124160, y);
         return 0;
+    }
+
+    int batch = xLen / 5120;
+    if (batch < 1) batch = 1;
+    if (batch > 4) batch = 4;
+
+    if (layer_idx == -100 || layer_idx == -101) {
+        if (layer_idx == -100) {
+            memcpy(g_dsp_lin_x_fwht, x, (size_t)batch * 5120 * sizeof(float));
+            if (signs_5120) {
+                for (int b = 0; b < batch; b++) {
+                    for (int w = 0; w < 5; w++) {
+                        dsp_fwht1024_block(g_dsp_lin_x_fwht + (size_t)b * 5120 + w * 1024, signs_5120 + w * 1024);
+                    }
+                }
+            }
+        }
+        if (batch == 1) {
+            int r0 = hvx_gemv_q1(31040, 5120, 1280, g_dsp_lin_x_fwht, in_bits,   in_scales,   g_dsp_lm_logits + 0 * 31040);
+            if (r0 != 0) return r0;
+            int r1 = hvx_gemv_q1(31040, 5120, 1280, g_dsp_lin_x_fwht, out_bits,  out_scales,  g_dsp_lm_logits + 1 * 31040);
+            if (r1 != 0) return r1;
+            int r2 = hvx_gemv_q1(31040, 5120, 1280, g_dsp_lin_x_fwht, gate_bits, gate_scales, g_dsp_lm_logits + 2 * 31040);
+            if (r2 != 0) return r2;
+            int r3 = hvx_gemv_q1(31040, 5120, 1280, g_dsp_lin_x_fwht, down_bits, down_scales, g_dsp_lm_logits + 3 * 31040);
+            if (r3 != 0) return r3;
+            dsp_argmax_n(g_dsp_lm_logits, 124160, (layer_idx == -100) ? 0 : 124160, y);
+            return 0;
+        } else {
+            const unsigned char* cb[4] = { in_bits, out_bits, gate_bits, down_bits };
+            const short*         cs[4] = { in_scales, out_scales, gate_scales, down_scales };
+            int half_base = (layer_idx == -100) ? 0 : 124160;
+            for (int c = 0; c < 4; c++) {
+                int rc_c = hvx_gemm_q1(batch, 31040, 5120, 1280, g_dsp_lin_x_fwht, cb[c], cs[c], g_dsp_lm_logits);
+                if (rc_c != 0) return rc_c;
+                int r_base = half_base + c * 31040;
+                for (int b = 0; b < batch; b++) {
+                    dsp_argmax_n(g_dsp_lm_logits + (size_t)b * 31040, 31040, r_base, y + ((size_t)b * 4 + c) * 66);
+                }
+            }
+            return 0;
+        }
     }
 
     if (layer_idx <= -200 && layer_idx >= -203) {
@@ -1818,102 +2102,111 @@ int hvx_lin_layer_fused(int layer_idx,
         int code = -10000 - layer_idx;
         int fi   = code & 15;
         int pos  = code >> 4;
-        if (pos < 0 || pos >= g_dsp_kv_ctx_max || !kvk || !kvv || !kvks || !kvvs) return -4;
+        if (pos < 0 || pos + batch - 1 >= g_dsp_kv_ctx_max || !kvk || !kvv || !kvks || !kvvs) return -4;
 
         const uint8_t* f_aux  = lin_aux + (size_t)48 * 1188736 + (size_t)fi * 43008;
         const float* in_norm  = (const float*)(f_aux + 0);
         post_norm             = (const float*)(f_aux + 20480);
         const float* qnw      = (const float*)(f_aux + 40960);
         const float* knw      = (const float*)(f_aux + 41984);
-        const float* rope_row = (const float*)(lin_aux + (size_t)48 * 1188736 + (size_t)16 * 43008 + (size_t)pos * 256);
 
-        memcpy(g_dsp_layer_h, x, 5120 * sizeof(float));
+        memcpy(g_dsp_layer_h, x, (size_t)batch * 5120 * sizeof(float));
 
-        // 1. Input RMSNorm + FWHT-5120 + qkv_proj GEMV (14336 x 5120)
-        dsp_rmsnorm_5120(g_dsp_layer_h, in_norm, g_dsp_lin_x_fwht);
-        if (signs_5120) {
-            for (int w = 0; w < 5; w++) {
-                dsp_fwht1024_block(g_dsp_lin_x_fwht + w * 1024, signs_5120 + w * 1024);
+        // 1. Input RMSNorm + FWHT-5120 + qkv_proj GEMV/GEMM (14336 x 5120)
+        for (int b = 0; b < batch; b++) {
+            dsp_rmsnorm_5120(g_dsp_layer_h + (size_t)b * 5120, in_norm, g_dsp_lin_x_fwht + (size_t)b * 5120);
+            if (signs_5120) {
+                for (int w = 0; w < 5; w++) {
+                    dsp_fwht1024_block(g_dsp_lin_x_fwht + (size_t)b * 5120 + w * 1024, signs_5120 + w * 1024);
+                }
             }
         }
-        rc = hvx_gemv_q1(14336, 5120, 1280, g_dsp_lin_x_fwht, in_bits, in_scales, g_dsp_lin_qkv_z);
+        rc = (batch == 1) ?
+            hvx_gemv_q1(14336, 5120, 1280, g_dsp_lin_x_fwht, in_bits, in_scales, g_dsp_lin_qkv_z) :
+            hvx_gemm_q1(batch, 14336, 5120, 1280, g_dsp_lin_x_fwht, in_bits, in_scales, g_dsp_lin_qkv_z);
         if (rc != 0) return rc;
-
-        // 2. K-head RMSNorm + NeoX RoPE + BF16-packed Q8_0 KV-cache write (4 KV heads)
-        float* kk = g_dsp_lin_qkv_z + 12288;
-        const float* vv = g_dsp_lin_qkv_z + 13312;
-        const HVX_UVector* vKnw = (const HVX_UVector*)knw;
-        const HVX_UVector* vRope = (const HVX_UVector*)rope_row;
-        HVX_Vector vCos = vRope[0], vSin = vRope[1];
 
         size_t kv_stride = g_dsp_turbo4 ? 32 : 128;
         uint32_t* K_layer = kvk  + (size_t)fi * 4 * g_dsp_kv_ctx_max * kv_stride;
         uint32_t* V_layer = kvv  + (size_t)fi * 4 * g_dsp_kv_ctx_max * kv_stride;
         float* KS_layer   = kvks + (size_t)fi * 4 * g_dsp_kv_ctx_max;
         float* VS_layer   = kvvs + (size_t)fi * 4 * g_dsp_kv_ctx_max;
+        const HVX_UVector* vKnw = (const HVX_UVector*)knw;
 
-        for (int hk = 0; hk < 4; hk++) {
-            float* r = kk + hk * 256;
-            HVX_UVector* vK = (HVX_UVector*)r;
-            HVX_Vector v0 = vK[0], v1 = vK[1], v2 = vK[2], v3 = vK[3];
-            HVX_Vector v4 = vK[4], v5 = vK[5], v6 = vK[6], v7 = vK[7];
-            HVX_Vector s01 = Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(v0, v0), Q6_Vqf32_vmpy_VsfVsf(v1, v1));
-            HVX_Vector s23 = Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(v2, v2), Q6_Vqf32_vmpy_VsfVsf(v3, v3));
-            HVX_Vector s45 = Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(v4, v4), Q6_Vqf32_vmpy_VsfVsf(v5, v5));
-            HVX_Vector s67 = Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(v6, v6), Q6_Vqf32_vmpy_VsfVsf(v7, v7));
-            HVX_Vector s03 = Q6_Vqf32_vadd_Vqf32Vqf32(s01, s23);
-            HVX_Vector s47 = Q6_Vqf32_vadd_Vqf32Vqf32(s45, s67);
-            float sk = hvx_reduce_sum32(Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vqf32(s03, s47)));
-            float inv = 1.0f / sqrtf(sk * (1.0f / 256.0f) + 1e-6f);
-            int32_t inv_bits;
-            memcpy(&inv_bits, &inv, 4);
-            HVX_Vector vInv = Q6_V_vsplat_R(inv_bits);
+        for (int b = 0; b < batch; b++) {
+            int cur_pos = pos + b;
+            const float* rope_row = (const float*)(lin_aux + (size_t)48 * 1188736 + (size_t)16 * 43008 + (size_t)cur_pos * 256);
+            float* qkv_b = g_dsp_lin_qkv_z + (size_t)b * 14336;
+            float* kk = qkv_b + 12288;
+            const float* vv = qkv_b + 13312;
+            const HVX_UVector* vRope = (const HVX_UVector*)rope_row;
+            HVX_Vector vCos = vRope[0], vSin = vRope[1];
 
-            v0 = Q6_Vsf_vmpy_VsfVsf(Q6_Vsf_vmpy_VsfVsf(v0, vInv), vKnw[0]);
-            v1 = Q6_Vsf_vmpy_VsfVsf(Q6_Vsf_vmpy_VsfVsf(v1, vInv), vKnw[1]);
-            vK[2] = Q6_Vsf_vmpy_VsfVsf(Q6_Vsf_vmpy_VsfVsf(v2, vInv), vKnw[2]);
-            vK[3] = Q6_Vsf_vmpy_VsfVsf(Q6_Vsf_vmpy_VsfVsf(v3, vInv), vKnw[3]);
-            vK[4] = Q6_Vsf_vmpy_VsfVsf(Q6_Vsf_vmpy_VsfVsf(v4, vInv), vKnw[4]);
-            vK[5] = Q6_Vsf_vmpy_VsfVsf(Q6_Vsf_vmpy_VsfVsf(v5, vInv), vKnw[5]);
-            vK[6] = Q6_Vsf_vmpy_VsfVsf(Q6_Vsf_vmpy_VsfVsf(v6, vInv), vKnw[6]);
-            vK[7] = Q6_Vsf_vmpy_VsfVsf(Q6_Vsf_vmpy_VsfVsf(v7, vInv), vKnw[7]);
+            for (int hk = 0; hk < 4; hk++) {
+                float* r = kk + hk * 256;
+                HVX_UVector* vK = (HVX_UVector*)r;
+                HVX_Vector v0 = vK[0], v1 = vK[1], v2 = vK[2], v3 = vK[3];
+                HVX_Vector v4 = vK[4], v5 = vK[5], v6 = vK[6], v7 = vK[7];
+                HVX_Vector s01 = Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(v0, v0), Q6_Vqf32_vmpy_VsfVsf(v1, v1));
+                HVX_Vector s23 = Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(v2, v2), Q6_Vqf32_vmpy_VsfVsf(v3, v3));
+                HVX_Vector s45 = Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(v4, v4), Q6_Vqf32_vmpy_VsfVsf(v5, v5));
+                HVX_Vector s67 = Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(v6, v6), Q6_Vqf32_vmpy_VsfVsf(v7, v7));
+                HVX_Vector s03 = Q6_Vqf32_vadd_Vqf32Vqf32(s01, s23);
+                HVX_Vector s47 = Q6_Vqf32_vadd_Vqf32Vqf32(s45, s67);
+                float sk = hvx_reduce_sum32(Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vqf32(s03, s47)));
+                float inv = 1.0f / sqrtf(sk * (1.0f / 256.0f) + 1e-6f);
+                int32_t inv_bits;
+                memcpy(&inv_bits, &inv, 4);
+                HVX_Vector vInv = Q6_V_vsplat_R(inv_bits);
 
-            vK[0] = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vsub_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(v0, vCos), Q6_Vqf32_vmpy_VsfVsf(v1, vSin)));
-            vK[1] = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(v0, vSin), Q6_Vqf32_vmpy_VsfVsf(v1, vCos)));
+                v0 = Q6_Vsf_vmpy_VsfVsf(Q6_Vsf_vmpy_VsfVsf(v0, vInv), vKnw[0]);
+                v1 = Q6_Vsf_vmpy_VsfVsf(Q6_Vsf_vmpy_VsfVsf(v1, vInv), vKnw[1]);
+                vK[2] = Q6_Vsf_vmpy_VsfVsf(Q6_Vsf_vmpy_VsfVsf(v2, vInv), vKnw[2]);
+                vK[3] = Q6_Vsf_vmpy_VsfVsf(Q6_Vsf_vmpy_VsfVsf(v3, vInv), vKnw[3]);
+                vK[4] = Q6_Vsf_vmpy_VsfVsf(Q6_Vsf_vmpy_VsfVsf(v4, vInv), vKnw[4]);
+                vK[5] = Q6_Vsf_vmpy_VsfVsf(Q6_Vsf_vmpy_VsfVsf(v5, vInv), vKnw[5]);
+                vK[6] = Q6_Vsf_vmpy_VsfVsf(Q6_Vsf_vmpy_VsfVsf(v6, vInv), vKnw[6]);
+                vK[7] = Q6_Vsf_vmpy_VsfVsf(Q6_Vsf_vmpy_VsfVsf(v7, vInv), vKnw[7]);
 
-            if (g_dsp_turbo4) {
-                dsp_q4_enc_128b(r,            K_layer + ((size_t)hk * g_dsp_kv_ctx_max + pos) * 32, &KS_layer[(size_t)hk * g_dsp_kv_ctx_max + pos]);
-                dsp_q4_enc_128b(vv + hk * 256, V_layer + ((size_t)hk * g_dsp_kv_ctx_max + pos) * 32, &VS_layer[(size_t)hk * g_dsp_kv_ctx_max + pos]);
-            } else {
-                dsp_q8_enc_bf16_256(r,            K_layer + ((size_t)hk * g_dsp_kv_ctx_max + pos) * 128, &KS_layer[(size_t)hk * g_dsp_kv_ctx_max + pos]);
-                dsp_q8_enc_bf16_256(vv + hk * 256, V_layer + ((size_t)hk * g_dsp_kv_ctx_max + pos) * 128, &VS_layer[(size_t)hk * g_dsp_kv_ctx_max + pos]);
+                vK[0] = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vsub_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(v0, vCos), Q6_Vqf32_vmpy_VsfVsf(v1, vSin)));
+                vK[1] = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(v0, vSin), Q6_Vqf32_vmpy_VsfVsf(v1, vCos)));
+
+                if (g_dsp_turbo4) {
+                    dsp_q4_enc_128b(r,            K_layer + ((size_t)hk * g_dsp_kv_ctx_max + cur_pos) * 32, &KS_layer[(size_t)hk * g_dsp_kv_ctx_max + cur_pos]);
+                    dsp_q4_enc_128b(vv + hk * 256, V_layer + ((size_t)hk * g_dsp_kv_ctx_max + cur_pos) * 32, &VS_layer[(size_t)hk * g_dsp_kv_ctx_max + cur_pos]);
+                } else {
+                    dsp_q8_enc_bf16_256(r,            K_layer + ((size_t)hk * g_dsp_kv_ctx_max + cur_pos) * 128, &KS_layer[(size_t)hk * g_dsp_kv_ctx_max + cur_pos]);
+                    dsp_q8_enc_bf16_256(vv + hk * 256, V_layer + ((size_t)hk * g_dsp_kv_ctx_max + cur_pos) * 128, &VS_layer[(size_t)hk * g_dsp_kv_ctx_max + cur_pos]);
+                }
+            }
+
+            float* no_b = g_dsp_lin_no + (size_t)b * 6144;
+            for (int w = 0; w < NUM_WORKERS; w++) {
+                g_tasks[w].task_type  = TASK_FULL_GQA;
+                g_tasks[w].h0         = w * 4;
+                g_tasks[w].h1         = (w + 1) * 4;
+                g_tasks[w].c0         = cur_pos + 1;
+                g_tasks[w].qkv        = qkv_b;
+                g_tasks[w].sc         = g_dsp_sc_buf[w];
+                g_tasks[w].nw         = qnw;
+                g_tasks[w].cw         = rope_row;
+                g_tasks[w].wa         = K_layer;
+                g_tasks[w].wb         = V_layer;
+                g_tasks[w].alog       = KS_layer;
+                g_tasks[w].dtb        = VS_layer;
+                g_tasks[w].no         = no_b;
+                g_tasks[w].fwht_signs = signs_6144 ? (signs_6144 + w * 1024) : NULL;
+                qurt_sem_up(&g_sem_start[w]);
+            }
+            for (int w = 0; w < NUM_WORKERS; w++) {
+                qurt_sem_down(&g_sem_done[w]);
             }
         }
 
-        // 3. Parallel 6-Thread QuRT HVX Q-Norm + RoPE + GQA + Sigmoid Gate + Fused FWHT-6144
-        for (int w = 0; w < NUM_WORKERS; w++) {
-            g_tasks[w].task_type  = TASK_FULL_GQA;
-            g_tasks[w].h0         = w * 4;
-            g_tasks[w].h1         = (w + 1) * 4;
-            g_tasks[w].c0         = pos + 1;
-            g_tasks[w].qkv        = g_dsp_lin_qkv_z;
-            g_tasks[w].sc         = g_dsp_sc_buf[w];
-            g_tasks[w].nw         = qnw;
-            g_tasks[w].cw         = rope_row;
-            g_tasks[w].wa         = K_layer;
-            g_tasks[w].wb         = V_layer;
-            g_tasks[w].alog       = KS_layer;
-            g_tasks[w].dtb        = VS_layer;
-            g_tasks[w].no         = g_dsp_lin_no;
-            g_tasks[w].fwht_signs = signs_6144 ? (signs_6144 + w * 1024) : NULL;
-            qurt_sem_up(&g_sem_start[w]);
-        }
-        for (int w = 0; w < NUM_WORKERS; w++) {
-            qurt_sem_down(&g_sem_done[w]);
-        }
-
-        // 4. out_proj GEMV (5120 x 6144, prow = 1536)
-        rc = hvx_gemv_q1(5120, 6144, 1536, g_dsp_lin_no, out_bits, out_scales, g_dsp_layer_yo);
+        // 4. out_proj GEMV/GEMM (5120 x 6144, prow = 1536)
+        rc = (batch == 1) ?
+            hvx_gemv_q1(5120, 6144, 1536, g_dsp_lin_no, out_bits, out_scales, g_dsp_layer_yo) :
+            hvx_gemm_q1(batch, 5120, 6144, 1536, g_dsp_lin_no, out_bits, out_scales, g_dsp_layer_yo);
         if (rc != 0) return rc;
     } else if (layer_idx < 0) {
         int fi = -1 - layer_idx;
@@ -1932,51 +2225,167 @@ int hvx_lin_layer_fused(int layer_idx,
         const float* in_norm = (const float*)(aux_layer + 1147776);
         post_norm            = (const float*)(aux_layer + 1168256);
 
-        memcpy(g_dsp_layer_h, x, 5120 * sizeof(float));
+        memcpy(g_dsp_layer_h, x, (size_t)batch * 5120 * sizeof(float));
 
-        // 1. Input RMSNorm
-        dsp_rmsnorm_5120(g_dsp_layer_h, in_norm, g_dsp_layer_xn);
+        if (batch == 1) {
+            dsp_rmsnorm_5120(g_dsp_layer_h, in_norm, g_dsp_layer_xn);
+            rc = hvx_lin_attn_fused(layer_idx, g_dsp_layer_xn,
+                                    in_bits, in_scales,
+                                    out_bits, out_scales,
+                                    ssm_conv, ssm_rec, lin_aux,
+                                    signs_5120, signs_6144,
+                                    g_dsp_layer_yo);
+            if (rc != 0) return rc;
+        } else {
+            for (int b = 0; b < batch; b++) {
+                dsp_rmsnorm_5120(g_dsp_layer_h + (size_t)b * 5120, in_norm, g_dsp_layer_xn + (size_t)b * 5120);
+                memcpy(g_dsp_lin_x_fwht + (size_t)b * 5120, g_dsp_layer_xn + (size_t)b * 5120, 5120 * sizeof(float));
+                if (signs_5120) {
+                    for (int w = 0; w < 5; w++) {
+                        dsp_fwht1024_block(g_dsp_lin_x_fwht + (size_t)b * 5120 + w * 1024, signs_5120 + w * 1024);
+                    }
+                }
+            }
+            rc = hvx_gemm_q1(batch, 16384, 5120, 1280, g_dsp_lin_x_fwht, in_bits, in_scales, g_dsp_lin_qkv_z);
+            if (rc != 0) return rc;
 
-        // 2. Fused Linear Attention Block
-        rc = hvx_lin_attn_fused(layer_idx, g_dsp_layer_xn,
-                                in_bits, in_scales,
-                                out_bits, out_scales,
-                                ssm_conv, ssm_rec, lin_aux,
-                                signs_5120, signs_6144,
-                                g_dsp_layer_yo);
-        if (rc != 0) return rc;
+            const uint32_t* wa = (const uint32_t*)(aux_layer + 0);
+            const uint32_t* wb = (const uint32_t*)(aux_layer + 491520);
+            const float* cw    = (const float*)(aux_layer + 983040);
+            const float* alog  = (const float*)(aux_layer + 1146880);
+            const float* dtb   = (const float*)(aux_layer + 1147072);
+            const float* nw    = (const float*)(aux_layer + 1147264);
+            float* conv        = (float*)ssm_conv + (size_t)layer_idx * 10240 * 3;
+            float* S_layer     = (float*)ssm_rec + (size_t)layer_idx * 48 * 128 * 128;
+
+            float avec[4 * 48] __attribute__((aligned(128)));
+            float bvec[4 * 48] __attribute__((aligned(128)));
+
+            // Fused Multi-Token Prep: reads wa/wb [1 MB] ONCE across all batch tokens!
+            int c_chunk = 54 * 32;
+            for (int w = 0; w < NUM_WORKERS; w++) {
+                int c0 = w * c_chunk;
+                int c1 = (w + 1) * c_chunk;
+                if (c0 > 10240) c0 = 10240;
+                if (c1 > 10240) c1 = 10240;
+                g_tasks[w].task_type = TASK_LIN_PREP;
+                g_tasks[w].batch = batch;
+                g_tasks[w].r0 = layer_idx;
+                g_tasks[w].h0 = w * 8;
+                g_tasks[w].h1 = (w + 1) * 8;
+                g_tasks[w].x_in = g_dsp_layer_xn;
+                g_tasks[w].wa = wa;
+                g_tasks[w].wb = wb;
+                g_tasks[w].avec_out = avec;
+                g_tasks[w].bvec_out = bvec;
+                g_tasks[w].cw = cw;
+                g_tasks[w].conv = conv;
+                g_tasks[w].conv_bak = g_dsp_ssm_conv_bak;
+                g_tasks[w].qkv = g_dsp_lin_qkv_z;
+                g_tasks[w].c0 = c0;
+                g_tasks[w].c1 = c1;
+                qurt_sem_up(&g_sem_start[w]);
+            }
+            for (int w = 0; w < NUM_WORKERS; w++) {
+                qurt_sem_down(&g_sem_done[w]);
+            }
+
+            // Q / K RMSNorm on 16 heads for each batch token (in L1 cache)
+            for (int b = 0; b < batch; b++) {
+                float* q = g_dsp_lin_qkv_z + (size_t)b * 16384;
+                float* k = q + 2048;
+                for (int h = 0; h < 16; h++) {
+                    const HVX_UVector* vQ = (const HVX_UVector*)(q + h * 128);
+                    const HVX_UVector* vK = (const HVX_UVector*)(k + h * 128);
+                    HVX_Vector vQ01 = Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(vQ[0], vQ[0]), Q6_Vqf32_vmpy_VsfVsf(vQ[1], vQ[1]));
+                    HVX_Vector vQ23 = Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(vQ[2], vQ[2]), Q6_Vqf32_vmpy_VsfVsf(vQ[3], vQ[3]));
+                    float sq = hvx_reduce_sum32(Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vqf32(vQ01, vQ23)));
+
+                    HVX_Vector vK01 = Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(vK[0], vK[0]), Q6_Vqf32_vmpy_VsfVsf(vK[1], vK[1]));
+                    HVX_Vector vK23 = Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(vK[2], vK[2]), Q6_Vqf32_vmpy_VsfVsf(vK[3], vK[3]));
+                    float sk = hvx_reduce_sum32(Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vqf32(vK01, vK23)));
+
+                    float iq = (1.0f / sqrtf(sq + 1e-6f)) * 0.08838834765f;
+                    float ik = 1.0f / sqrtf(sk + 1e-6f);
+                    int32_t iq_bits, ik_bits;
+                    memcpy(&iq_bits, &iq, 4);
+                    memcpy(&ik_bits, &ik, 4);
+                    HVX_Vector vIQ = Q6_V_vsplat_R(iq_bits);
+                    HVX_Vector vIK = Q6_V_vsplat_R(ik_bits);
+                    HVX_UVector* vQ_out = (HVX_UVector*)(q + h * 128);
+                    HVX_UVector* vK_out = (HVX_UVector*)(k + h * 128);
+                    for (int c = 0; c < 4; c++) {
+                        vQ_out[c] = Q6_Vsf_vmpy_VsfVsf(vQ[c], vIQ);
+                        vK_out[c] = Q6_Vsf_vmpy_VsfVsf(vK[c], vIK);
+                    }
+                }
+            }
+
+            // Fused Multi-Token DeltaNet Recurrence: reads/writes S_layer [6.29 MB] ONCE across all batch tokens!
+            for (int w = 0; w < NUM_WORKERS; w++) {
+                g_tasks[w].task_type = TASK_DELTANET;
+                g_tasks[w].batch = batch;
+                g_tasks[w].r0 = layer_idx;
+                g_tasks[w].h0 = w * 8;
+                g_tasks[w].h1 = (w + 1) * 8;
+                g_tasks[w].alog = alog;
+                g_tasks[w].dtb = dtb;
+                g_tasks[w].avec = avec;
+                g_tasks[w].bvec = bvec;
+                g_tasks[w].q = g_dsp_lin_qkv_z;
+                g_tasks[w].k = g_dsp_lin_qkv_z + 2048;
+                g_tasks[w].v = g_dsp_lin_qkv_z + 4096;
+                g_tasks[w].z = g_dsp_lin_qkv_z + 10240;
+                g_tasks[w].nw = nw;
+                g_tasks[w].S = S_layer;
+                g_tasks[w].no = g_dsp_lin_no;
+                g_tasks[w].rec_bak = g_dsp_ssm_rec_bak;
+                g_tasks[w].fwht_signs = signs_6144 ? (signs_6144 + w * 1024) : NULL;
+                qurt_sem_up(&g_sem_start[w]);
+            }
+            for (int w = 0; w < NUM_WORKERS; w++) {
+                qurt_sem_down(&g_sem_done[w]);
+            }
+
+            rc = hvx_gemm_q1(batch, 5120, 6144, 1536, g_dsp_lin_no, out_bits, out_scales, g_dsp_layer_yo);
+            if (rc != 0) return rc;
+        }
     }
 
     // 3. Residual 1 (h += yo)
     HVX_UVector* vh = (HVX_UVector*)g_dsp_layer_h;
     const HVX_UVector* vyo = (const HVX_UVector*)g_dsp_layer_yo;
-    for (int g = 0; g < 160; g++) {
+    for (int g = 0; g < batch * 160; g++) {
         vh[g] = Q6_Vsf_vadd_VsfVsf(vh[g], vyo[g]);
     }
 
-    // 4. Post-Attention RMSNorm
-    dsp_rmsnorm_5120(g_dsp_layer_h, post_norm, g_dsp_layer_xn);
-
-    // 5. HVX MLP Input FWHT-5120 directly in L1 cache (zero semaphore barrier!)
-    if (signs_5120) {
-        for (int w = 0; w < 5; w++) {
-            dsp_fwht1024_block(g_dsp_layer_xn + w * 1024, signs_5120 + w * 1024);
+    // 4. Post-Attention RMSNorm + 5. HVX MLP Input FWHT-5120
+    for (int b = 0; b < batch; b++) {
+        dsp_rmsnorm_5120(g_dsp_layer_h + (size_t)b * 5120, post_norm, g_dsp_layer_xn + (size_t)b * 5120);
+        if (signs_5120) {
+            for (int w = 0; w < 5; w++) {
+                dsp_fwht1024_block(g_dsp_layer_xn + (size_t)b * 5120 + w * 1024, signs_5120 + w * 1024);
+            }
         }
     }
 
-    // 6. Fused MLP: gate_up GEMV -> SwiGLU + FWHT-1024 -> down_proj GEMV
-    rc = hvx_gemv_q1(34816, 5120, 1280, g_dsp_layer_xn, gate_bits, gate_scales, mlp_gate_up_buf);
+    // 6. Fused MLP: gate_up GEMV/GEMM -> SwiGLU + FWHT-1024 -> down_proj GEMV/GEMM
+    rc = (batch == 1) ?
+        hvx_gemv_q1(34816, 5120, 1280, g_dsp_layer_xn, gate_bits, gate_scales, mlp_gate_up_buf) :
+        hvx_gemm_q1(batch, 34816, 5120, 1280, g_dsp_layer_xn, gate_bits, gate_scales, mlp_gate_up_buf);
     if (rc != 0) return rc;
 
-    rc = hvx_swiglu_fwht1024(1, mlp_gate_up_buf, signs_17408, mlp_fwht_buf);
+    rc = hvx_swiglu_fwht1024(batch, mlp_gate_up_buf, signs_17408, mlp_fwht_buf);
     if (rc != 0) return rc;
 
-    rc = hvx_gemv_q1(5120, 17408, 4352, mlp_fwht_buf, down_bits, down_scales, g_dsp_layer_yo);
+    rc = (batch == 1) ?
+        hvx_gemv_q1(5120, 17408, 4352, mlp_fwht_buf, down_bits, down_scales, g_dsp_layer_yo) :
+        hvx_gemm_q1(batch, 5120, 17408, 4352, mlp_fwht_buf, down_bits, down_scales, g_dsp_layer_yo);
     if (rc != 0) return rc;
 
     // 7. Residual 2 (y = h + yo)
     HVX_UVector* vy = (HVX_UVector*)y;
-    for (int g = 0; g < 160; g++) {
+    for (int g = 0; g < batch * 160; g++) {
         vy[g] = Q6_Vsf_vadd_VsfVsf(vh[g], vyo[g]);
     }
     return 0;

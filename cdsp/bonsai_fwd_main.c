@@ -1395,6 +1395,11 @@ static int cdsp_gemv(const char* name, const float* x, float* y) {
 
 static int g_fast_argmax_idx = -1;
 static float g_fast_argmax_val = 0.0f;
+static int g_batch_argmax_idx[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
+static float g_batch_argmax_val[8] = {0};
+static float g_batch_cand_val[8][256];
+static int   g_batch_cand_idx[8][256];
+static int   g_batch_ncands[8] = {0};
 
 static int cdsp_lmhead_batch(const float* x, int B, float* logits) {
     if (stage_init()) return -98;
@@ -1404,6 +1409,11 @@ static int cdsp_lmhead_batch(const float* x, int B, float* logits) {
     uint32_t prow = tensor_prow(th);
     g_fast_argmax_idx = -1;
     g_fast_argmax_val = -1e30f;
+    for (int b = 0; b < B && b < 8; b++) {
+        g_batch_argmax_idx[b] = -1;
+        g_batch_argmax_val[b] = -1e30f;
+        g_batch_ncands[b] = 0;
+    }
 
     const char* lmc_env = getenv("BONSAI_LM_CHUNK");
     int chunk = lmc_env ? atoi(lmc_env) : 31040;
@@ -1417,61 +1427,77 @@ static int cdsp_lmhead_batch(const float* x, int B, float* logits) {
     static int s_force_4call = 0;
     if (s_force_4call && lm_calls_mode <= 2) lm_calls_mode = 4;
 
-    if (g_temp <= 0.01f && g_lm_static_cdsp && g_lm_bits && g_lm_scales && lm_calls_mode <= 2) {
+    if (B <= 4 && g_lm_static_cdsp && g_lm_bits && g_lm_scales && lm_calls_mode <= 2) {
         int ok_2call = 1;
-        for (int b = 0; b < B; b++) {
-            memcpy(g_xs, x + (size_t)b * th->in, (size_t)th->in * sizeof(float));
-            int b_fast_argmax_idx = -1;
-            float b_fast_argmax_val = -1e30f;
-            for (int h = 0; h < 2; h++) {
-                int r_base = h * 4 * 31040;
-                const uint8_t* b0 = g_lm_bits + (size_t)(r_base + 0 * 31040) * prow;
-                const uint8_t* b1 = g_lm_bits + (size_t)(r_base + 1 * 31040) * prow;
-                const uint8_t* b2 = g_lm_bits + (size_t)(r_base + 2 * 31040) * prow;
-                const uint8_t* b3 = g_lm_bits + (size_t)(r_base + 3 * 31040) * prow;
-                const short*   s0 = (const short*)g_lm_scales + (size_t)(r_base + 0 * 31040) * ng;
-                const short*   s1 = (const short*)g_lm_scales + (size_t)(r_base + 1 * 31040) * ng;
-                const short*   s2 = (const short*)g_lm_scales + (size_t)(r_base + 2 * 31040) * ng;
-                const short*   s3 = (const short*)g_lm_scales + (size_t)(r_base + 3 * 31040) * ng;
-                double t_r0 = now_ms();
-                uint64_t u_r0 = (g_profile_tree && B == 1) ? now_us() : 0;
-                int rc_h = bonsai_lin_layer_fused(g_h, -100 - h,
-                                                  g_xs, (int)th->in,
-                                                  b0, 31040 * (int)prow, s0, 31040 * (int)ng,
-                                                  b1, 31040 * (int)prow, s1, 31040 * (int)ng,
-                                                  b2, 31040 * (int)prow, s2, 31040 * (int)ng,
-                                                  b3, 31040 * (int)prow, s3, 31040 * (int)ng,
-                                                  g_ys, 16);
-                double t_r1 = now_ms();
-                if (rc_h != 0) {
-                    fprintf(stderr, "[fwd] 2-call static LM head h=%d returned rc=0x%x (%d), falling back to 4-call fused path\n", h, rc_h, rc_h);
-                    s_force_4call = 1;
-                    lm_calls_mode = 4;
-                    ok_2call = 0;
-                    b_fast_argmax_idx = -1;
-                    break;
-                }
-                g_t_rpc += (t_r1 - t_r0);
-                g_calls_rpc++;
-                if (g_profile_tree && B == 1) g_prof.t_lmhead_rpc_us += (now_us() - u_r0);
-                float v = g_ys[0];
-                int32_t idx = 0;
-                memcpy(&idx, &g_ys[1], 4);
-                if (b_fast_argmax_idx < 0 || v > b_fast_argmax_val) {
-                    b_fast_argmax_val = v;
-                    b_fast_argmax_idx = idx;
-                }
+        memcpy(g_xs, x, (size_t)B * th->in * sizeof(float));
+        for (int h = 0; h < 2; h++) {
+            int r_base = h * 4 * 31040;
+            const uint8_t* b0 = g_lm_bits + (size_t)(r_base + 0 * 31040) * prow;
+            const uint8_t* b1 = g_lm_bits + (size_t)(r_base + 1 * 31040) * prow;
+            const uint8_t* b2 = g_lm_bits + (size_t)(r_base + 2 * 31040) * prow;
+            const uint8_t* b3 = g_lm_bits + (size_t)(r_base + 3 * 31040) * prow;
+            const short*   s0 = (const short*)g_lm_scales + (size_t)(r_base + 0 * 31040) * ng;
+            const short*   s1 = (const short*)g_lm_scales + (size_t)(r_base + 1 * 31040) * ng;
+            const short*   s2 = (const short*)g_lm_scales + (size_t)(r_base + 2 * 31040) * ng;
+            const short*   s3 = (const short*)g_lm_scales + (size_t)(r_base + 3 * 31040) * ng;
+            double t_r0 = now_ms();
+            uint64_t u_r0 = (g_profile_tree && B == 1) ? now_us() : 0;
+            int rc_h = bonsai_lin_layer_fused(g_h, -100 - h,
+                                              g_xs, B * (int)th->in,
+                                              b0, 31040 * (int)prow, s0, 31040 * (int)ng,
+                                              b1, 31040 * (int)prow, s1, 31040 * (int)ng,
+                                              b2, 31040 * (int)prow, s2, 31040 * (int)ng,
+                                              b3, 31040 * (int)prow, s3, 31040 * (int)ng,
+                                              g_ys, B * 4 * 66);
+            double t_r1 = now_ms();
+            if (rc_h != 0) {
+                fprintf(stderr, "[fwd] 2-call static LM head h=%d returned rc=0x%x (%d), falling back to 4-call fused path\n", h, rc_h, rc_h);
+                s_force_4call = 1;
+                lm_calls_mode = 4;
+                ok_2call = 0;
+                break;
             }
-            if (!ok_2call) break;
-            if (b == 0) {
-                g_fast_argmax_val = b_fast_argmax_val;
-                g_fast_argmax_idx = b_fast_argmax_idx;
-            }
-            if (b_fast_argmax_idx >= 0 && b_fast_argmax_idx < 248320) {
-                logits[(size_t)b * th->out + b_fast_argmax_idx] = b_fast_argmax_val;
+            g_t_rpc += (t_r1 - t_r0);
+            g_calls_rpc++;
+            if (g_profile_tree && B == 1) g_prof.t_lmhead_rpc_us += (now_us() - u_r0);
+            int n_blks = (B == 1) ? 1 : 4;
+            for (int b = 0; b < B; b++) {
+                for (int c = 0; c < n_blks; c++) {
+                    const float* blk = (B == 1) ? g_ys : (g_ys + ((size_t)b * 4 + c) * 66);
+                    float v = blk[0];
+                    int32_t idx = 0;
+                    memcpy(&idx, &blk[1], 4);
+                    if (g_batch_argmax_idx[b] < 0 || v > g_batch_argmax_val[b]) {
+                        g_batch_argmax_val[b] = v;
+                        g_batch_argmax_idx[b] = idx;
+                    }
+                    for (int k = 0; k < 32; k++) {
+                        float cv = blk[2 + 2 * k + 0];
+                        int32_t ci = 0;
+                        memcpy(&ci, &blk[2 + 2 * k + 1], 4);
+                        if (ci >= 0 && ci < 248320) {
+                            logits[(size_t)b * th->out + ci] = cv;
+                            int nc = g_batch_ncands[b];
+                            if (nc < 256) {
+                                g_batch_cand_val[b][nc] = cv;
+                                g_batch_cand_idx[b][nc] = ci;
+                                g_batch_ncands[b] = nc + 1;
+                            }
+                        }
+                    }
+                }
             }
         }
-        if (ok_2call) return 0;
+        if (ok_2call) {
+            g_fast_argmax_val = g_batch_argmax_val[0];
+            g_fast_argmax_idx = g_batch_argmax_idx[0];
+            for (int b = 0; b < B; b++) {
+                if (g_batch_argmax_idx[b] >= 0 && g_batch_argmax_idx[b] < 248320) {
+                    logits[(size_t)b * th->out + g_batch_argmax_idx[b]] = g_batch_argmax_val[b];
+                }
+            }
+            return 0;
+        }
     }
 
     if (g_temp <= 0.01f && g_lm_static_cdsp && g_lm_bits && g_lm_scales && lm_calls_mode == 4) {
@@ -2430,18 +2456,18 @@ static int forward_tokens_batch(const int* toks, int start_pos, int B, float* ou
                 g_prof.layers[L].c0.t_wait_us = u_lwait;
             }
 
-            for (int b = 0; b < B; b++) {
-                memcpy(g_xs, h_b + (size_t)b * HIDDEN, HIDDEN * sizeof(float));
+            if (B <= 4) {
+                memcpy(g_xs, h_b, (size_t)B * HIDDEN * sizeof(float));
 
                 double t_r0 = now_ms();
                 uint64_t u_lrpc0 = (g_profile_tree && B == 1) ? now_us() : 0;
                 int rc_layer = bonsai_lin_layer_fused(g_h, li,
-                                                      g_xs, HIDDEN,
+                                                      g_xs, B * HIDDEN,
                                                       b0, 16384 * 1280, s0, 16384 * 40,
                                                       b1, 5120 * 1536,  s1, 5120 * 48,
                                                       b2, 34816 * 1280, s2, 34816 * 40,
                                                       b3, 5120 * 4352,  s3, 5120 * 136,
-                                                      g_ys, HIDDEN);
+                                                      g_ys, B * HIDDEN);
                 double t_r1 = now_ms();
                 g_t_rpc += (t_r1 - t_r0);
                 g_calls_rpc++;
@@ -2453,7 +2479,28 @@ static int forward_tokens_batch(const int* toks, int start_pos, int B, float* ou
                     printf("bonsai_lin_layer_fused L=%d li=%d err rc=%d\n", L, li, rc_layer);
                     return rc_layer;
                 }
-                memcpy(h_b + (size_t)b * HIDDEN, g_ys, HIDDEN * sizeof(float));
+                memcpy(h_b, g_ys, (size_t)B * HIDDEN * sizeof(float));
+            } else {
+                for (int b = 0; b < B; b++) {
+                    memcpy(g_xs, h_b + (size_t)b * HIDDEN, HIDDEN * sizeof(float));
+
+                    double t_r0 = now_ms();
+                    int rc_layer = bonsai_lin_layer_fused(g_h, li,
+                                                          g_xs, HIDDEN,
+                                                          b0, 16384 * 1280, s0, 16384 * 40,
+                                                          b1, 5120 * 1536,  s1, 5120 * 48,
+                                                          b2, 34816 * 1280, s2, 34816 * 40,
+                                                          b3, 5120 * 4352,  s3, 5120 * 136,
+                                                          g_ys, HIDDEN);
+                    double t_r1 = now_ms();
+                    g_t_rpc += (t_r1 - t_r0);
+                    g_calls_rpc++;
+                    if (rc_layer != 0) {
+                        printf("bonsai_lin_layer_fused L=%d li=%d err rc=%d\n", L, li, rc_layer);
+                        return rc_layer;
+                    }
+                    memcpy(h_b + (size_t)b * HIDDEN, g_ys, HIDDEN * sizeof(float));
+                }
             }
             g_cur_call += 4;
             if (!is_static_l) {
@@ -2516,19 +2563,18 @@ static int forward_tokens_batch(const int* toks, int start_pos, int B, float* ou
                     g_prof.layers[L].c0.t_wait_us = u_lwait;
                 }
 
-                for (int b = 0; b < B; b++) {
-                    int cur_pos = start_pos + b;
-                    memcpy(g_xs, h_b + (size_t)b * HIDDEN, HIDDEN * sizeof(float));
+                if (B <= 4) {
+                    memcpy(g_xs, h_b, (size_t)B * HIDDEN * sizeof(float));
 
                     double t_r0 = now_ms();
                     uint64_t u_lrpc0 = (g_profile_tree && B == 1) ? now_us() : 0;
-                    int rc_full = bonsai_lin_layer_fused(g_h, -10000 - (cur_pos * 16 + fi),
-                                                         g_xs, HIDDEN,
+                    int rc_full = bonsai_lin_layer_fused(g_h, -10000 - (start_pos * 16 + fi),
+                                                         g_xs, B * HIDDEN,
                                                          b0, 14336 * 1280, s0, 14336 * 40,
                                                          b1, 5120 * 1536,  s1, 5120 * 48,
                                                          b2, 34816 * 1280, s2, 34816 * 40,
                                                          b3, 5120 * 4352,  s3, 5120 * 136,
-                                                         g_ys, HIDDEN);
+                                                         g_ys, B * HIDDEN);
                     double t_r1 = now_ms();
                     g_t_rpc += (t_r1 - t_r0);
                     g_calls_rpc++;
@@ -2537,10 +2583,32 @@ static int forward_tokens_batch(const int* toks, int start_pos, int B, float* ou
                         g_prof.layers[L].c0.t_total_us = g_prof.layers[L].c0.t_wait_us + g_prof.layers[L].c0.t_rpc_us;
                     }
                     if (rc_full != 0) {
-                        printf("bonsai_lin_layer_fused(full 1-call) L=%d fi=%d pos=%d err rc=%d\n", L, fi, cur_pos, rc_full);
+                        printf("bonsai_lin_layer_fused(full 1-call) L=%d fi=%d pos=%d err rc=%d\n", L, fi, start_pos, rc_full);
                         return rc_full;
                     }
-                    memcpy(h_b + (size_t)b * HIDDEN, g_ys, HIDDEN * sizeof(float));
+                    memcpy(h_b, g_ys, (size_t)B * HIDDEN * sizeof(float));
+                } else {
+                    for (int b = 0; b < B; b++) {
+                        int cur_pos = start_pos + b;
+                        memcpy(g_xs, h_b + (size_t)b * HIDDEN, HIDDEN * sizeof(float));
+
+                        double t_r0 = now_ms();
+                        int rc_full = bonsai_lin_layer_fused(g_h, -10000 - (cur_pos * 16 + fi),
+                                                             g_xs, HIDDEN,
+                                                             b0, 14336 * 1280, s0, 14336 * 40,
+                                                             b1, 5120 * 1536,  s1, 5120 * 48,
+                                                             b2, 34816 * 1280, s2, 34816 * 40,
+                                                             b3, 5120 * 4352,  s3, 5120 * 136,
+                                                             g_ys, HIDDEN);
+                        double t_r1 = now_ms();
+                        g_t_rpc += (t_r1 - t_r0);
+                        g_calls_rpc++;
+                        if (rc_full != 0) {
+                            printf("bonsai_lin_layer_fused(full 1-call) L=%d fi=%d pos=%d err rc=%d\n", L, fi, cur_pos, rc_full);
+                            return rc_full;
+                        }
+                        memcpy(h_b + (size_t)b * HIDDEN, g_ys, HIDDEN * sizeof(float));
+                    }
                 }
                 g_cur_call += 4;
                 if (!is_static_l) {
@@ -3303,24 +3371,113 @@ static inline int sample_top_p(const float* lgt, int n, float temp, float top_p)
     return cands[cutoff_idx - 1].id;
 }
 
+static inline int sample_batch_token(int b, float* lgt, float temp, float top_p) {
+    if (temp <= 0.01f) {
+        if (b >= 0 && b < 4 && g_batch_argmax_idx[b] >= 0 && g_batch_argmax_idx[b] < 248320) {
+            if (lgt) lgt[g_batch_argmax_idx[b]] = g_batch_argmax_val[b];
+            return g_batch_argmax_idx[b];
+        }
+        return sample_argmax_token(lgt);
+    }
+    if (b >= 0 && b < 4 && g_batch_ncands[b] > 0) {
+        int nc = g_batch_ncands[b];
+        float mx = g_batch_argmax_val[b];
+        float cutoff = mx - 10.0f * temp;
+        TokenCand cands[64];
+        int n_cand = 0;
+        for (int i = 0; i < nc; i++) {
+            float v = g_batch_cand_val[b][i];
+            int idx = g_batch_cand_idx[b][i];
+            if (v >= cutoff && idx >= 0 && idx < 248320) {
+                if (lgt) lgt[idx] = v;
+                int dup = 0;
+                for (int j = 0; j < n_cand; j++) {
+                    if (cands[j].id == idx) { dup = 1; break; }
+                }
+                if (!dup) {
+                    cands[n_cand].id = idx;
+                    cands[n_cand].prob = expf((v - mx) / temp);
+                    n_cand++;
+                }
+            }
+        }
+        if (n_cand <= 0) return g_batch_argmax_idx[b];
+        for (int i = 1; i < n_cand; i++) {
+            TokenCand key = cands[i];
+            int j = i - 1;
+            while (j >= 0 && cands[j].prob < key.prob) {
+                cands[j + 1] = cands[j];
+                j--;
+            }
+            cands[j + 1] = key;
+        }
+        float total_p = 0.0f;
+        for (int i = 0; i < n_cand; i++) total_p += cands[i].prob;
+        float inv_p = (total_p > 0.0f) ? (1.0f / total_p) : 1.0f;
+        for (int i = 0; i < n_cand; i++) cands[i].prob *= inv_p;
+
+        float cum_p = 0.0f;
+        int cutoff_idx = n_cand;
+        for (int i = 0; i < n_cand; i++) {
+            cum_p += cands[i].prob;
+            if (cum_p >= top_p) {
+                cutoff_idx = i + 1;
+                break;
+            }
+        }
+        float r = ((float)rand() / (float)RAND_MAX) * cum_p;
+        float acc = 0.0f;
+        for (int i = 0; i < cutoff_idx; i++) {
+            acc += cands[i].prob;
+            if (r <= acc) return cands[i].id;
+        }
+        return cands[cutoff_idx - 1].id;
+    }
+    return sample_top_p(lgt, 248320, temp, top_p);
+}
+
 static int draft_prompt_lookup(const int* history, int n_hist, int* drafts, int max_drafts) {
-    if (n_hist < 4 || max_drafts <= 0) return 0;
-    for (int gram_len = 3; gram_len >= 2; gram_len--) {
+    if (n_hist < 2 || max_drafts <= 0) return 0;
+    for (int gram_len = 3; gram_len >= 1; gram_len--) {
         if (n_hist < gram_len + 1) continue;
         const int* target = history + n_hist - gram_len;
+        if (gram_len == 1) {
+            int t0 = target[0];
+            // For 1-gram, only trigger on structural/sentence tokens ('.', ',', '\n', 'The', ' and')
+            if (t0 != 13 && t0 != 11 && t0 != 198 && t0 != 760 && t0 != 320) continue;
+        }
+        int first_i = -1;
+        int second_i = -1;
         for (int i = n_hist - gram_len - 1; i >= 0; i--) {
             int match = 1;
             for (int k = 0; k < gram_len; k++) {
                 if (history[i + k] != target[k]) { match = 0; break; }
             }
             if (match) {
-                int found = 0;
-                int src = i + gram_len;
-                while (src < n_hist && found < max_drafts) {
-                    drafts[found++] = history[src++];
-                }
-                if (found > 0) return found;
+                if (first_i < 0) first_i = i;
+                else { second_i = i; break; }
             }
+        }
+        if (first_i >= 0) {
+            int cap = max_drafts;
+            if (second_i >= 0) {
+                // If this n-gram appeared multiple times, only draft tokens where the occurrences agree!
+                int agree = 0;
+                while (agree < cap &&
+                       (first_i + gram_len + agree) < (n_hist - gram_len) &&
+                       (second_i + gram_len + agree) < n_hist) {
+                    if (history[first_i + gram_len + agree] != history[second_i + gram_len + agree]) break;
+                    agree++;
+                }
+                cap = agree;
+            }
+            int found = 0;
+            int src = first_i + gram_len;
+            while (src < n_hist - gram_len && found < cap) {
+                drafts[found++] = history[src++];
+            }
+            if (found > 0) return found;
+            if (second_i >= 0 && cap == 0) return 0; // Variable slot detected, do not fall back to shorter n-gram
         }
     }
     return 0;
@@ -3454,7 +3611,7 @@ int main(int argc, char** argv) {
     printf("prompt tokens=%d\n", nids);
 
     const char* pchunk_env = getenv("BONSAI_PREFILL_CHUNK");
-    int max_pchunk = pchunk_env ? atoi(pchunk_env) : (g_fused_lin ? 1 : 8);
+    int max_pchunk = pchunk_env ? atoi(pchunk_env) : (g_fused_lin ? 4 : 8);
     if (max_pchunk < 1) max_pchunk = 1;
     if (max_pchunk > 8) max_pchunk = 8;
 
@@ -3480,43 +3637,86 @@ int main(int argc, char** argv) {
 
     const char* mtp_env = getenv("BONSAI_MTP");
     int mtp_active = (mtp_env && atoi(mtp_env) != 0);
+    const char* mtp_drafts_env = getenv("BONSAI_MTP_DRAFTS");
+    int max_mtp_drafts = mtp_drafts_env ? atoi(mtp_drafts_env) : 3;
+    if (max_mtp_drafts < 1) max_mtp_drafts = 1;
+    if (max_mtp_drafts > 3) max_mtp_drafts = 3;
     if (mtp_active) {
-        printf("[fwd] Multi-Token Prediction (MTP / Prompt Lookup Speculative Decoding) ENABLED\n");
+        printf("[fwd] Multi-Token Prediction (MTP / Speculative Decoding, max_drafts=%d) ENABLED\n", max_mtp_drafts);
     }
 
     int cur = ids[nids - 1];
     g_t_rpc = 0; g_t_memcpy = 0; g_t_trans = 0; g_calls_rpc = 0;
     int s = 0;
+    int total_mtp_accepted = 0;
+    int total_mtp_steps = 0;
+    double t_gen_start = now_ms();
     while (s < nsteps) {
         int pos = (nids - 1) + s;
-        int drafts[2];
-        int n_draft = (mtp_active && s + 1 < nsteps) ? draft_prompt_lookup(gen_hist, n_gen, drafts, 1) : 0;
+        int drafts[3];
+        int rem_drafts = (nsteps - 1 - s);
+        if (rem_drafts > max_mtp_drafts) rem_drafts = max_mtp_drafts;
+        int n_draft = (mtp_active && rem_drafts > 0) ? draft_prompt_lookup(gen_hist, n_gen, drafts, rem_drafts) : 0;
 
         if (n_draft > 0) {
-            // MTP speculative branch with B = 2
-            int vtoks[2] = { cur, drafts[0] };
+            int B = 1 + n_draft;
+            int vtoks[4];
+            vtoks[0] = cur;
+            for (int d = 0; d < n_draft; d++) vtoks[1 + d] = drafts[d];
+
             double a = now_ms();
-            if (forward_tokens_batch(vtoks, pos, 2, g_hidden_batch) == 0 &&
-                cdsp_lmhead_batch(g_hidden_batch, 2, logits) == 0) {
+            if (forward_tokens_batch(vtoks, pos, B, g_hidden_batch) == 0 &&
+                cdsp_lmhead_batch(g_hidden_batch, B, logits) == 0) {
                 double b = now_ms();
-                int bi_0 = (g_temp <= 0.01f) ? sample_argmax_token(logits) : sample_top_p(logits, 248320, g_temp, g_top_p);
-                if (bi_0 == drafts[0]) {
-                    // Match! Both tokens accepted!
-                    int bi_1 = (g_temp <= 0.01f) ? sample_argmax_token(logits + 248320) : sample_top_p(logits + 248320, 248320, g_temp, g_top_p);
-                    unsigned char dec0[256], dec1[256];
-                    int nb0 = tok_decode(&bi_0, 1, dec0, sizeof(dec0));
-                    int nb1 = tok_decode(&bi_1, 1, dec1, sizeof(dec1));
-                    dec0[nb0 < 0 ? 0 : (nb0 > 255 ? 255 : nb0)] = 0;
-                    dec1[nb1 < 0 ? 0 : (nb1 > 255 ? 255 : nb1)] = 0;
-                    printf("step %d [MTP 2x MATCH] tok0=%d (%s) tok1=%d (%s) total=%.0fms (%.1f ms/tok = %.2f tok/s | NPU_RPC=%.0fms [%d calls])\n",
-                           s, bi_0, (const char*)dec0, bi_1, (const char*)dec1, b - a, (b - a) / 2.0, 2000.0 / (b - a), g_t_rpc, g_calls_rpc);
-                    gen_hist[n_gen++] = bi_0;
-                    gen_hist[n_gen++] = bi_1;
-                    cur = bi_1;
-                    s += 2;
-                    g_t_rpc = 0; g_t_memcpy = 0; g_t_trans = 0; g_calls_rpc = 0;
-                    continue;
+                int accepted_toks[4];
+                int n_acc = 0;
+                for (int d = 0; d < B; d++) {
+                    int pred = sample_batch_token(d, logits + (size_t)d * 248320, g_temp, g_top_p);
+                    accepted_toks[n_acc++] = pred;
+                    if (d < n_draft && pred != drafts[d]) {
+                        // Draft d missed; pred is still the valid bonus/replacement token at position d!
+                        break;
+                    }
                 }
+                // If not all drafts matched (n_acc < B), undo ONLY rejected tokens b = B-1 down to n_acc on DSP
+                if (n_acc < B && g_fused_lin) {
+                    float dummy_in[4] = {0}, dummy_out[4] = {0};
+                    int undo_code = -500 - ((B << 4) | n_acc);
+                    bonsai_lin_layer_fused(g_h, undo_code, dummy_in, 4,
+                                           NULL, 0, NULL, 0, NULL, 0, NULL, 0,
+                                           NULL, 0, NULL, 0, NULL, 0, NULL, 0,
+                                           dummy_out, 4);
+                }
+
+                if (n_acc >= 2) {
+                    char tok_summary[512];
+                    size_t off = 0;
+                    for (int k = 0; k < n_acc; k++) {
+                        unsigned char dec_k[128];
+                        int nb_k = tok_decode(&accepted_toks[k], 1, dec_k, sizeof(dec_k) - 1);
+                        dec_k[nb_k < 0 ? 0 : nb_k] = 0;
+                        off += snprintf(tok_summary + off, sizeof(tok_summary) - off,
+                                        "%stok%d=%d(%s)", (k > 0 ? " " : ""), k, accepted_toks[k], (const char*)dec_k);
+                        gen_hist[n_gen++] = accepted_toks[k];
+                    }
+                    printf("step %d..%d [MTP %dx MATCH!] %s total=%.0fms (%.1f ms/tok = %.2f tok/s | NPU_RPC=%.0fms [%d calls])\n",
+                           s, s + n_acc - 1, n_acc, tok_summary, b - a, (b - a) / n_acc, (1000.0 * n_acc) / (b - a), g_t_rpc, g_calls_rpc);
+                } else {
+                    int bi = accepted_toks[0];
+                    unsigned char dec[256];
+                    int nb = tok_decode(&bi, 1, dec, sizeof(dec) - 1);
+                    dec[nb < 0 ? 0 : nb] = 0;
+                    printf("step %d [MTP 1x] tok=%d logit=%.3f %s total=%.0fms (NPU_RPC=%.0fms [%d calls], trans=%.0fms, memcpy=%.0fms, CPU_math=%.0fms)\n",
+                           s, bi, logits[bi], (const char*)dec, b - a,
+                           g_t_rpc, g_calls_rpc, g_t_trans, g_t_memcpy, (b - a) - g_t_rpc - g_t_trans - g_t_memcpy);
+                    gen_hist[n_gen++] = bi;
+                }
+                total_mtp_accepted += n_acc;
+                total_mtp_steps += 1;
+                cur = accepted_toks[n_acc - 1];
+                s += n_acc;
+                g_t_rpc = 0; g_t_memcpy = 0; g_t_trans = 0; g_calls_rpc = 0;
+                continue;
             }
         }
 
@@ -3532,14 +3732,8 @@ int main(int argc, char** argv) {
         double b = now_ms();
         // greedy or top-p sample
         uint64_t u_arg0 = (g_profile_tree) ? now_us() : 0;
-        int bi = 0, nan = 0;
-        if (g_temp <= 0.01f && g_fast_argmax_idx >= 0 && g_fast_argmax_idx < 248320) {
-            bi = g_fast_argmax_idx;
-        } else if (g_temp <= 0.01f) {
-            bi = sample_argmax_token(logits);
-        } else {
-            bi = sample_top_p(logits, 248320, g_temp, g_top_p);
-        }
+        int bi = sample_batch_token(0, logits, g_temp, g_top_p);
+        int nan = 0;
         if (g_profile_tree) {
             g_prof.t_argmax_us = now_us() - u_arg0;
             g_prof.t_token_total_us = now_us() - u_tok_start;
@@ -3560,9 +3754,19 @@ int main(int argc, char** argv) {
             print_profile_tree(&g_prof, s);
         }
         gen_hist[n_gen++] = bi;
+        total_mtp_accepted += 1;
+        total_mtp_steps += 1;
         g_t_rpc = 0; g_t_memcpy = 0; g_t_trans = 0; g_calls_rpc = 0;
         cur = bi;
         s++;
+    }
+    double t_gen_end = now_ms();
+    if (nsteps > 0) {
+        printf("\n[SUMMARY] Generated %d tokens in %d NPU steps (%.1f ms total = %.1f ms/tok = %.2f tok/s | avg %.2f tok/step)\n",
+               total_mtp_accepted, total_mtp_steps, t_gen_end - t_gen_start,
+               (t_gen_end - t_gen_start) / (total_mtp_accepted > 0 ? total_mtp_accepted : 1),
+               (1000.0 * total_mtp_accepted) / (t_gen_end - t_gen_start),
+               (double)total_mtp_accepted / (total_mtp_steps > 0 ? total_mtp_steps : 1));
     }
 
     const char* vbatch_env = getenv("BONSAI_VERIFY_BATCH");

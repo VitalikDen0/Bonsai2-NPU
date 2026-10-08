@@ -197,7 +197,7 @@ static int generate_stream(const char* prompt, int max_gen_tokens, float* logits
     int p_pos = 0;
     while (p_pos < n_prefill) {
         int chunk = n_prefill - p_pos;
-        if (chunk > 1) chunk = 1;
+        if (chunk > 4) chunk = 4;
         if (forward_tokens_batch(prompt_ids + p_pos, p_pos, chunk, g_hidden_batch)) {
             return -2;
         }
@@ -214,14 +214,7 @@ static int generate_stream(const char* prompt, int max_gen_tokens, float* logits
         if (forward_tokens_batch(&cur, pos, 1, hidden)) break;
         if (cdsp_lmhead(hidden, logits_buf)) break;
 
-        int bi = 0;
-        if (g_fast_argmax_idx >= 0 && g_fast_argmax_idx < 248320) {
-            bi = g_fast_argmax_idx;
-        } else {
-            for (int i = 0; i < 248320; i++) {
-                if (logits_buf[i] > logits_buf[bi]) bi = i;
-            }
-        }
+        int bi = sample_batch_token(0, logits_buf, g_temp, g_top_p);
 
         if (bi == TOK_IM_END || bi == TOK_ENDOFTEXT) {
             if (cb) cb(bi, "", 1, user_arg);

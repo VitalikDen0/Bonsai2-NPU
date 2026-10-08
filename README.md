@@ -112,8 +112,8 @@ adb shell "export ADSP_LIBRARY_PATH=/data/local/tmp; cd /data/local/tmp && ./bon
 
 ## Roadmap & Upcoming Enhancements
 
-* [x] **Multi-Token Prediction (MTP) Speculative Decoding**: Integrated CPU prompt-lookup n-gram proposer with the batched NPU verification kernel (`forward_tokens_batch` B = 2/4) directly into the main decode loop to achieve real-world **5.0–8.0 tok/s**. Enabled via `export BONSAI_MTP=1`.
-* [x] **TurboQuant & Turbo4 Mode (4-Bit KV-Cache)**: Implemented 4-bit nibble packing (`dsp_q4_enc`) and fast vectorized dot-product in HVX to slash KV-cache footprint to **16 KiB/token** (4x reduction), reducing per-token decode latency to **~370 ms/tok** and enabling long context within mobile RAM limits. Enabled via `--turbo4` or `export BONSAI_TURBO4=1`.
+* [x] **Multi-Token Prediction (MTP) Speculative Decoding & Rank-1 Inverse Rollback**: Integrated CPU prompt-lookup n-gram proposer (`1..3` draft tokens) with single-pass HVX batched verification (`B = 2..4` in 66 RPC calls), register-resident multi-token DeltaNet recurrence, and 6-thread HVX Rank-1 Inverse State Rollback (`TASK_DELTANET_UNDO`), achieving **4.9–6.54 tok/s** (153–203 ms/tok) on accepted multi-token steps and **349 ms/tok (2.87 tok/s)** on single-token steps even with stochastic sampling (`--temp 0.6 --top-p 0.9`). Enabled via `export BONSAI_MTP=1`.
+* [x] **TurboQuant & Turbo4 Mode (4-Bit KV-Cache)**: Implemented 4-bit nibble packing (`dsp_tq4_quantize_256`) and fast vectorized dot-product in HVX to slash KV-cache footprint to **16 KiB/token** (4x reduction), maintaining **~349 ms/tok** single-token decode latency and **160–166 ms/tok (6.0–6.25 tok/s)** prefill throughput. Enabled via `--turbo4` or `export BONSAI_TURBO4=1`.
 * [ ] **Android JNI & Standalone APK**: Providing ready-to-run JNI wrappers and an on-device UI application for one-click installation without ADB or terminal setup.
 
 ---
